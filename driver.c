@@ -149,19 +149,11 @@ static void stepperPulseStart (uint8_t dir_outbits, uint8_t step_outbits, uint32
 }
 
 // Disable limit pins interrupt, called from mc_homing_cycle()
-static void limitsDisable (void) {
-	GPIOIntDisable(LIMIT_PORT, HWLIMIT_MASK); // Disable Pin Change Interrupt
-}
-
-// Enable limit pins interrupt, called from mc_homing_cycle() and settings_store_global_setting()
-// TODO: combine init & disable and (re)move from settings_store_global_setting (to settings_changed() below)
-static void limitsInit (void) {
-
-	  if (bit_istrue(settings.flags, BITFLAG_HARD_LIMIT_ENABLE))
-		  GPIOIntEnable(LIMIT_PORT, HWLIMIT_MASK); // Enable Pin Change Interrupt
-	  else
-		  limitsDisable();
-
+static void limitsEnable (bool on) {
+    if (on && bit_istrue(settings.flags, BITFLAG_HARD_LIMIT_ENABLE))
+        GPIOIntEnable(LIMIT_PORT, HWLIMIT_MASK); // Enable Pin Change Interrupt
+    else
+        GPIOIntDisable(LIMIT_PORT, HWLIMIT_MASK); // Disable Pin Change Interrupt
 }
 
 // Returns limit state as a bit-wise uint8 variable. Each bit indicates an axis limit, where
@@ -195,10 +187,8 @@ inline static uint8_t systemGetState (void) {
 // and the probing cycle modes for toward-workpiece/away-from-workpiece.
 static void probeConfigureInvertMask(bool is_probe_away)
 {
-  probe_invert_mask = 0; // Initialize as zero.
 
-  if (bit_isfalse(settings.flags, BITFLAG_INVERT_PROBE_PIN))
-	  probe_invert_mask ^= PROBE_MASK;
+  probe_invert_mask = bit_isfalse(settings.flags, BITFLAG_INVERT_PROBE_PIN) ? PROBE_MASK : 0;
 
   if (is_probe_away)
 	  probe_invert_mask ^= PROBE_MASK;
@@ -397,6 +387,8 @@ static uint16_t serialRxBuffer (void) {
     return RX_BUFFER_SIZE;
 }
 
+// EEPROM handling
+
 static inline uint32_t putByte (uint32_t target, uint32_t source, uint32_t byte) {
     uint32_t mask = 0xFF;
     byte <<= 3;
@@ -472,7 +464,7 @@ static void eepromWriteBlockWithChecksum (unsigned int destination, char *source
 
 int eepromReadBlockWithChecksum (char *destination, unsigned int source, unsigned int size) {
 
-    uint8_t *data,cs;
+    uint8_t *data;
     uint32_t alignstart = (source & 0x03), alignend = 4 - ((alignstart + size) & 0x03), alignsize = size + alignstart + alignend;
 
     if(alignstart || alignend) {
@@ -490,9 +482,7 @@ int eepromReadBlockWithChecksum (char *destination, unsigned int source, unsigne
     } else
         EEPROMRead((uint32_t *)destination, source + EEPROMOFFSET, size);
 
-    cs = calc_checksum(destination, size);
-    cs = eeprom_get_char(source + size);
-    return calc_checksum(destination, size) == cs ; //eeprom_get_char(source + size);
+    return calc_checksum(destination, size) == eeprom_get_char(source + size);
 }
 
 // Callback to inform settings has been changed, called by settings_store_global_setting() and local mcu_init()
@@ -666,7 +656,7 @@ static void mcu_init (void) {
 }
 
 // Initialize HAL pointers
-// NOTE: Grbl is not yet (configured from EEPROM data), mcu_init() will be called when done
+// NOTE: Grbl is not yet configured (from EEPROM data), mcu_init() will be called when done
 bool driver_init (void) {
 
 	ms_delayCycles = SysCtlClockGet() / 3000; // tics per ms
@@ -680,10 +670,7 @@ bool driver_init (void) {
 
 	serialInit();
 
-	memset(&hal, 0, sizeof(HAL));  // Clear...
-
 	hal.initMCU = &mcu_init;
-	//	hal.releaseMPU)(void);
 	hal.f_step_timer = 16000000;
 	hal.delay_ms = &driver_delay_ms;
 	hal.delay_us = &driver_delay_us;
@@ -694,8 +681,7 @@ bool driver_init (void) {
 	hal.stepper_set_directions = &stepperSetDirOutputs;
 	hal.stepper_cycles_per_tick = &stepperCyclesPerTick;
 	hal.stepper_pulse_start = &stepperPulseStart;
-	hal.limits_init = &limitsInit;
-	hal.limits_disable = &limitsDisable;
+	hal.limits_enable = &limitsEnable;
 	hal.limits_get_state = &limitsGetState;
 	hal.coolant_set_state = &coolantSetState;
 	hal.coolant_get_state = &coolantGetState;
@@ -712,7 +698,6 @@ bool driver_init (void) {
     hal.serial_get_rx_buffer_available = &serialRxFree;
     hal.serial_reset_read_buffer = &serialRxFlush;
     hal.serial_cancel_read_buffer = &serialRxCancel;
-	hal.serial_reset_read_buffer = &serialRxFlush;
 	hal.eeprom_get_char = &eepromGetChar;
 	hal.eeprom_put_char = &eepromPutChar;
 	hal.memcpy_to_eeprom_with_checksum = &eepromWriteBlockWithChecksum;
@@ -724,10 +709,6 @@ bool driver_init (void) {
 
 // no need to move version check before init - compiler will fail any mismatch for existing entries
 	return hal.version == 1;
-}
-
-bool mcu_release (void) {
-    return true;
 }
 
 /* interrupt handlers */
