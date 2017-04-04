@@ -105,7 +105,7 @@ static void stepperWakeUp (uint8_t delay) {
 	IntPendSet(INT_TIMER1A); 					// force immediate Timer1 interrupt
 }
 
-// Disables stepper driver interrups, called from st_go_idle()
+// Disables stepper driver interrupts, called from st_go_idle()
 static void stepperGoIdle (void) {
 	TimerDisable(TIMER1_BASE, TIMER_A);
 }
@@ -564,17 +564,17 @@ static void mcu_init (void) {
 
 	GPIOPinTypeGPIOOutput(STEPPERS_DISABLE_PORT, STEPPERS_DISABLE_PIN);
 
-	// Configure Timer1
+	// Configure stepper driver timer
 	TimerConfigure(TIMER1_BASE, TIMER_CFG_SPLIT_PAIR|TIMER_CFG_PERIODIC);
 	IntPrioritySet(INT_TIMER1A, 0x20); // lower priority than for Timer2 (which resets the step-dir signal)
 	TimerControlStall(TIMER1_BASE, TIMER_A, true); //timer1 will stall in debug mode
 	TimerIntRegister(TIMER1_BASE, TIMER_A, stepper_driver_isr);
 	TimerIntClear(TIMER1_BASE, 0xFFFF);
 	IntPendClear(INT_TIMER1A);
-	TimerPrescaleSet(TIMER1_BASE, TIMER_A, STEPPER_DRIVER_PRESCALER);
+	TimerPrescaleSet(TIMER1_BASE, TIMER_A, STEPPER_DRIVER_PRESCALER); // 20 MHz clock
 	TimerIntEnable(TIMER1_BASE, TIMER_TIMA_TIMEOUT);
 
-	// Configure step pulse timer (TIMER2)
+	// Configure step pulse timer
 //	TimerClockSourceSet(TIMER2_BASE, TIMER_CLOCK_SYSTEM);
 	TimerConfigure(TIMER2_BASE, TIMER_CFG_SPLIT_PAIR|TIMER_CFG_A_ONE_SHOT);
 	IntPrioritySet(INT_TIMER2A, 0x00); // highest priority - higher than for Timer1 (which sets the step-dir output)
@@ -671,7 +671,7 @@ bool driver_init (void) {
 	serialInit();
 
 	hal.initMCU = &mcu_init;
-	hal.f_step_timer = 16000000;
+	hal.f_step_timer = 20000000;
 	hal.delay_ms = &driver_delay_ms;
 	hal.delay_us = &driver_delay_us;
 	hal.stepper_wake_up = &stepperWakeUp;
@@ -694,6 +694,7 @@ bool driver_init (void) {
 	hal.system_control_get_state = &systemGetState;
     hal.serial_read = &serialGetC;
     hal.serial_write = (void (*)(uint8_t))&serialPutC;
+    hal.serial_write_string = &serialWriteS;
     hal.serial_get_rx_buffer_size = &serialRxBuffer;
     hal.serial_get_rx_buffer_available = &serialRxFree;
     hal.serial_reset_read_buffer = &serialRxFlush;
