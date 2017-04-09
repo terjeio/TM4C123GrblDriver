@@ -27,7 +27,9 @@
 
 #include "tiva.h"
 #include "driver.h"
+#include "eeprom.h"
 #include "serial.h"
+#include "usermcodes.h"
 
 // TODO: handle F_CPU in a portable way - it is not used as CPU frequency but rather ticks per counter increment/decrement for timer(s)
 // This implementation prescales step counter by four for a F_CPU of 20MHz to avoid overflow in Grbl code
@@ -387,104 +389,6 @@ static uint16_t serialRxBuffer (void) {
     return RX_BUFFER_SIZE;
 }
 
-// EEPROM handling
-
-static inline uint32_t putByte (uint32_t target, uint32_t source, uint32_t byte) {
-    uint32_t mask = 0xFF;
-    byte <<= 3;
-    mask = ~(mask << byte);
-    return (target & mask) | (source << byte);
-}
-
-static inline uint8_t getByte (uint32_t data, uint32_t byte) {
-    return (data >> (byte << 3)) & 0xFF;
-}
-
-static inline uint8_t calc_checksum (char *data, uint32_t size) {
-
-    uint8_t checksum = 0;
-
-    while(size--) {
-        checksum = (checksum << 1) || (checksum >> 7);
-        checksum += *(data++);
-    }
-
-    return checksum;
-}
-
-// Read/write eeprom configuration - do not set HAL pointers if not supported by MCU
-// Used by code in settingcs.c
-// NOTE: This implementation need some heap memory to work correctly, at least as much as the largest EEPROM block used + 4 bytes.
-//       It is due to Tiva C having word-aligned EEPROM access, the heap is used for temporary storage when word aligning the structs read/written.
-static inline uint8_t eepromGetChar (uint32_t addr) {
-
-    uint32_t data;
-
-    EEPROMRead(&data, (addr + EEPROMOFFSET) & 0xFFFFFFFC, 4);
-
-    return getByte(data, addr & 0x00000003);
-
-}
-
-static inline void eepromPutChar (uint32_t addr, uint8_t new_value) {
-
-    uint32_t data;
-
-    EEPROMRead(&data, (addr + EEPROMOFFSET) & 0xFFFFFFFC, 4);
-
-    data = putByte(data, (uint32_t)new_value, addr & 0x03);
-
-    EEPROMProgram(&data, (addr + EEPROMOFFSET) & 0xFFFFFFFC, 4);
-}
-
-static void eepromWriteBlockWithChecksum (unsigned int destination, char *source, unsigned int size) {
-
-    uint8_t *data;
-    uint32_t alignstart = (destination & 0x03), alignend = 4 - ((alignstart + size) & 0x03), alignsize = size + alignstart + alignend;
-
-    if(alignstart || alignend) {
-
-        if((data = malloc(alignsize)) != 0) {
-
-            EEPROMRead((uint32_t *)data, (destination - alignstart) + EEPROMOFFSET, alignsize);
-
-            memcpy(data + alignstart, source, size);
-
-            EEPROMProgram((uint32_t *)data, (destination - alignstart) + EEPROMOFFSET, alignsize);
-
-            free(data);
-
-        }
-
-    } else
-        EEPROMProgram((uint32_t *)source, destination + EEPROMOFFSET, size);
-
-    eeprom_put_char(destination + size, calc_checksum(source, size));
-}
-
-int eepromReadBlockWithChecksum (char *destination, unsigned int source, unsigned int size) {
-
-    uint8_t *data;
-    uint32_t alignstart = (source & 0x03), alignend = 4 - ((alignstart + size) & 0x03), alignsize = size + alignstart + alignend;
-
-    if(alignstart || alignend) {
-
-        if((data = malloc(alignsize)) != 0) {
-
-            EEPROMRead((uint32_t *)data, (source - alignstart) + EEPROMOFFSET, alignsize);
-
-            memcpy(destination, data + alignstart, size);
-
-            free(data);
-
-        }
-
-    } else
-        EEPROMRead((uint32_t *)destination, source + EEPROMOFFSET, size);
-
-    return calc_checksum(destination, size) == eeprom_get_char(source + size);
-}
-
 // Callback to inform settings has been changed, called by settings_store_global_setting() and local mcu_init()
 // Used here to set assorted helper variables
 void settings_changed (settings_t *settings) {
@@ -706,6 +610,9 @@ bool driver_init (void) {
 	hal.settings_changed = &settings_changed;
 	hal.set_bits_atomic = &bitsSetAtomic;
 	hal.clear_bits_atomic = &bitsClearAtomic;
+    hal.userdefined_mcode_check = &userMCodeCheck;
+    hal.userdefined_mcode_validate = &userMCodeValidate;
+    hal.userdefined_mcode_execute = &userMCodeExecute;
     hal.hasEEPROM = true;
 
 // no need to move version check before init - compiler will fail any mismatch for existing entries
