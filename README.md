@@ -5,10 +5,6 @@ This driver needs to be complemented with an UART or USB driver for host communi
 
 Features:
 
-* All hardware dependent code, except host communication, in a single file.
-* Entry point for executing G-code, bypasess serial input buffer - can be used for jogging etc.
-* User defined M-code handler. _**WARNING:** Not tested._
-* Improved jogging mode cancel, cancel will flush input buffer and stop any ongoing jog. Seems to work ok with 3-key rollover cursor key jogging implemented in my G-code sender. Not tested in a real machine but I have so far been unable to fail jog cancel.
-* Command \(CTRL-C\) for exiting Grbl.
+* All hardware dependent code, except host communication, in a separate project \(needs access to grbl library includes\).
 
 **NOTE:** currently only tested on a launchpad where the motor step outputs are connected to the RGB led.

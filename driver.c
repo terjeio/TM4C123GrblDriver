@@ -113,12 +113,22 @@ static void stepperGoIdle (void) {
 }
 
 // Sets up stepper driver interrupt timeout, called from stepper_driver_interrupt_handler()
-static void stepperCyclesPerTick (uint16_t prescaler, uint16_t cycles_per_tick) {
+static void stepperCyclesPerTick (uint32_t cycles_per_tick) {
 #ifndef ADAPTIVE_MULTI_AXIS_STEP_SMOOTHING
-	TimerPrescaleSet(TIMER1_BASE, TIMER_A, step_prescaler[prescaler]);
+    uint16_t prescaler;
+    // Compute step timing and timer prescalar for normal step generation.
+    if (cycles_per_tick < (1UL << 16)) // < 65536  (4.1ms @ 16MHz)
+      prescaler = step_prescaler[1]; // prescaler: 0
+    else if (cycles_per_tick < (1UL << 19)) { // < 524288 (32.8ms@16MHz)
+      prescaler = step_prescaler[2]; // prescaler: 8
+      cycles_per_tick = cycles_per_tick >> 3;
+    } else {
+      prescaler = step_prescaler[3]; // prescaler: 64
+      cycles_per_tick = cycles_per_tick >> 6;
+    }
+	TimerPrescaleSet(TIMER1_BASE, TIMER_A, prescaler);
 #endif
-	TimerLoadSet(TIMER1_BASE, TIMER_A, cycles_per_tick);
-
+	TimerLoadSet(TIMER1_BASE, TIMER_A, cycles_per_tick < (1UL << 16) /*< 65536 (4.1ms @ 16MHz)*/ ? cycles_per_tick : 0xffff /*Just set the slowest speed possible.*/);
 }
 
 // Set stepper pulse output pins, called from st_reset()
