@@ -86,7 +86,7 @@ static void driver_delay_us (uint32_t us) {
 // Enable/disable steppers, called from st_wake_up() and st_go_idle()
 static void stepperEnable (bool on) {
 
-	if (bit_istrue(settings.flags, BITFLAG_INVERT_ST_ENABLE))
+	if (settings.flags.invert_st_enable)
 		on = !on; // Apply pin invert.
 
     GPIOPinWrite(STEPPERS_DISABLE_PORT, STEPPERS_DISABLE_PIN, on ? STEPPERS_DISABLE_PIN : 0);
@@ -162,7 +162,7 @@ static void stepperPulseStart (uint8_t dir_outbits, uint8_t step_outbits, uint32
 
 // Disable limit pins interrupt, called from mc_homing_cycle()
 static void limitsEnable (bool on) {
-    if (on && bit_istrue(settings.flags, BITFLAG_HARD_LIMIT_ENABLE))
+    if (on && settings.flags.hard_limit_enable)
         GPIOIntEnable(LIMIT_PORT, HWLIMIT_MASK); // Enable Pin Change Interrupt
     else
         GPIOIntDisable(LIMIT_PORT, HWLIMIT_MASK); // Disable Pin Change Interrupt
@@ -175,23 +175,29 @@ inline static uint8_t limitsGetState() {
 
 	uint8_t pins = (uint8_t)GPIOPinRead(LIMIT_PORT, HWLIMIT_MASK);
 
-	if (bit_isfalse(settings.flags, BITFLAG_INVERT_LIMIT_PINS))
+	if (settings.flags.invert_limit_pins)
 		pins ^= HWLIMIT_MASK;
 
 	return pins >> 2;
 }
 
-inline static uint8_t systemGetState (void) {
+inline static controlsignals_t systemGetState (void) {
 
     uint8_t flags = GPIOPinRead(CONTROL_PORT, HWCONTROL_MASK) ^ CONTROL_INVERT_MASK;
+    controlsignals_t signals = {0};
 
-	return
+    if(flags & RESET_PIN)
+        signals.reset =  1;
 #ifdef ENABLE_SAFETY_DOOR_INPUT_PIN
-	        (flags & SAFETY_DOOR_PIN ? CONTROL_PIN_INDEX_SAFETY_DOOR : 0) |
+    else if(flags & SAFETY_DOOR_PIN)
+        signals.safety_door = 1;
 #endif
-	        (flags & RESET_PIN ? CONTROL_PIN_INDEX_RESET : 0) |
-	         (flags & FEED_HOLD_PIN ? CONTROL_PIN_INDEX_FEED_HOLD : 0) |
-	          (flags & CYCLE_START_PIN ? CONTROL_PIN_INDEX_CYCLE_START : 0);
+    else if(flags & FEED_HOLD_PIN)
+        signals.feed_hold = 1;
+    else if(flags & CYCLE_START_PIN)
+        signals.cycle_start = 1;
+
+	return signals;
 }
 
 // Called by probe_init() and the mc_probe() routines. Sets up the probe pin invert mask to
@@ -200,7 +206,7 @@ inline static uint8_t systemGetState (void) {
 static void probeConfigureInvertMask(bool is_probe_away)
 {
 
-  probe_invert_mask = bit_isfalse(settings.flags, BITFLAG_INVERT_PROBE_PIN) ? PROBE_MASK : 0;
+  probe_invert_mask = settings.flags.invert_probe_pin ? 0 : PROBE_MASK;
 
   if (is_probe_away)
 	  probe_invert_mask ^= PROBE_MASK;
@@ -222,8 +228,8 @@ uint32_t spindleComputePWMValue(float rpm) // 328p PWM register is 8-bit.
     sys.spindle_speed = settings.rpm_max;
     pwm_value = SPINDLE_PWM_MAX_VALUE;
   } else if (rpm <= settings.rpm_min) {
-    if (rpm == 0.0) { // S0 disables spindle
-      sys.spindle_speed = 0.0;
+    if (rpm == 0.0f) { // S0 disables spindle
+      sys.spindle_speed = 0.0f;
       pwm_value = SPINDLE_PWM_OFF_VALUE;
     } else { // Set minimum PWM output
       sys.spindle_speed = settings.rpm_min;
@@ -233,7 +239,7 @@ uint32_t spindleComputePWMValue(float rpm) // 328p PWM register is 8-bit.
     // Compute intermediate PWM value with linear spindle speed model.
     // NOTE: A nonlinear model could be installed here, if required, but keep it VERY light-weight.
     sys.spindle_speed = rpm;
-    pwm_value = floor((rpm-settings.rpm_min)*pwm_gradient) + SPINDLE_PWM_MIN_VALUE;
+    pwm_value = (uint32_t)floorf((rpm-settings.rpm_min)*pwm_gradient) + SPINDLE_PWM_MIN_VALUE;
   }
   return(pwm_value);
 }
@@ -414,6 +420,7 @@ void settings_changed (settings_t *settings) {
     pulse_time = settings->pulse_microseconds;
     step_port_invert_mask = settings->step_invert_mask;
     dir_port_invert_mask = settings->dir_invert_mask;
+    pwm_gradient = SPINDLE_PWM_RANGE / (settings->rpm_max - settings->rpm_min);
 
 //    curr_dir_outbits = 0xFF; // "forget" current dir flags
 }
@@ -425,10 +432,12 @@ static void bitsSetAtomic (volatile uint8_t *value, uint8_t bits) {
 	IntMasterEnable();
 }
 
-static void bitsClearAtomic (volatile uint8_t *value, uint8_t bits) {
-	IntMasterDisable();
+uint8_t bitsClearAtomic (volatile uint8_t *value, uint8_t bits) {
+    IntMasterDisable();
+    uint8_t prev = *value;
 	*value &= ~bits;
 	IntMasterEnable();
+	return prev;
 }
 
 // Initializes MCU peripherals for Grbl use TODO: rename?
@@ -548,8 +557,6 @@ static void mcu_init (void) {
     PWMGenConfigure(SPINDLEPWM, SPINDLEPWM_GEN, PWM_GEN_MODE_DOWN|PWM_GEN_MODE_GEN_SYNC_LOCAL);
 	PWMGenPeriodSet(SPINDLEPWM, SPINDLEPWM_GEN, PWM_MAX_VALUE);
     PWMOutputState(SPINDLEPWM, SPINDLEPWM_OUT_BIT, true);
-
-    pwm_gradient = SPINDLE_PWM_RANGE / (settings.rpm_max - settings.rpm_min);
 
 #endif
 
