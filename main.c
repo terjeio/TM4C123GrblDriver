@@ -8,10 +8,10 @@
 
 int main(void) {
 
-	SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL | SYSCTL_OSC_MAIN | SYSCTL_XTAL_16MHZ);
-
-	FPUEnable();
+    FPUEnable();
     FPULazyStackingEnable();
+
+	SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL | SYSCTL_OSC_MAIN | SYSCTL_XTAL_16MHZ);
 
 	grbl_enter();
 

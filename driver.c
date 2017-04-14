@@ -39,7 +39,8 @@
 #define STEPPER_DRIVER_PRESCALER 3
 
 static uint32_t ms_delayCycles, us_delayCycles;
-static uint8_t step_port_invert_mask, dir_port_invert_mask, pulse_time;
+static uint8_t pulse_time;
+static axes_signals_t step_port_invert_mask, dir_port_invert_mask;
 
 #ifdef VARIABLE_SPINDLE
     static bool pwmEnabled = false;
@@ -47,7 +48,7 @@ static uint8_t step_port_invert_mask, dir_port_invert_mask, pulse_time;
 #endif
 
 #ifdef STEP_PULSE_DELAY
-static uint8_t next_step_outbits, step_port_invert_mask, dir_port_invert_mask;
+static axes_signals_t next_step_outbits, step_port_invert_mask, dir_port_invert_mask;
 #endif
 
 #ifndef ADAPTIVE_MULTI_AXIS_STEP_SMOOTHING
@@ -134,25 +135,25 @@ static void stepperCyclesPerTick (uint32_t cycles_per_tick) {
 // Set stepper pulse output pins, called from st_reset()
 // NOTE: step_outbits are: bit0 -> X, bit1 -> Y, bit2 -> Z, needs to be mapped to physical pins by bit shifting or other means
 //       other means may be by bit-banding or lookup table...
-inline static void stepperSetStepOutputs (uint8_t step_outbits) {
-	GPIOPinWrite(STEP_PORT, HWSTEP_MASK, (step_outbits ^ step_port_invert_mask) << 1);
+inline static void stepperSetStepOutputs (axes_signals_t step_outbits) {
+	GPIOPinWrite(STEP_PORT, HWSTEP_MASK, (step_outbits.value ^ step_port_invert_mask.value) << 1);
 }
 
 // Set stepper direction output pins, called from st_reset()
 // NOTE1: step_outbits are: bit0 -> X, bit1 -> Y, bit2 -> Z, needs to be mapped to physical pins by bit shifting or other means
 //        other means may be by bit-banding or lookup table...
-inline static void stepperSetDirOutputs (uint8_t dir_outbits) {
-	GPIOPinWrite(DIRECTION_PORT, HWDIRECTION_MASK, (dir_outbits ^ dir_port_invert_mask) << 5);
+inline static void stepperSetDirOutputs (axes_signals_t dir_outbits) {
+	GPIOPinWrite(DIRECTION_PORT, HWDIRECTION_MASK, (dir_outbits.value ^ dir_port_invert_mask.value) << 5);
 }
 
 // Sets stepper direction and pulse pins and starts a step pulse, called from stepper_driver_interrupt_handler()
 // When delayed pulse the step register is written in the step delay interrupt handler
-static void stepperPulseStart (uint8_t dir_outbits, uint8_t step_outbits, uint32_t spindle_pwm) {
+static void stepperPulseStart (axes_signals_t dir_outbits, axes_signals_t step_outbits, uint32_t spindle_pwm) {
 
-    stepperSetDirOutputs(step_outbits);
+    stepperSetDirOutputs(dir_outbits);
 
 #ifdef STEP_PULSE_DELAY
-	next_step_outbits = (step_outbits ^ step_port_invert_mask) << 1; // Store out_bits
+	next_step_outbits = step_outbits; // Store out_bits
 #else  // Normal operation
 	stepperSetStepOutputs(step_outbits);
 #endif
@@ -171,14 +172,14 @@ static void limitsEnable (bool on) {
 // Returns limit state as a bit-wise uint8 variable. Each bit indicates an axis limit, where
 // triggered is 1 and not triggered is 0. Invert mask is applied. Axes are defined by their
 // number in bit position, i.e. Z_AXIS is (1<<2) or bit 2, and Y_AXIS is (1<<1) or bit 1.
-inline static uint8_t limitsGetState() {
+inline static axes_signals_t limitsGetState() {
 
 	uint8_t pins = (uint8_t)GPIOPinRead(LIMIT_PORT, HWLIMIT_MASK);
 
 	if (settings.flags.invert_limit_pins)
 		pins ^= HWLIMIT_MASK;
 
-	return pins >> 2;
+	return (axes_signals_t){pins >> 2};
 }
 
 inline static controlsignals_t systemGetState (void) {
@@ -187,15 +188,15 @@ inline static controlsignals_t systemGetState (void) {
     controlsignals_t signals = {0};
 
     if(flags & RESET_PIN)
-        signals.reset =  1;
+        signals.reset = true;
 #ifdef ENABLE_SAFETY_DOOR_INPUT_PIN
     else if(flags & SAFETY_DOOR_PIN)
-        signals.safety_door = 1;
+        signals.safety_door = true;
 #endif
     else if(flags & FEED_HOLD_PIN)
-        signals.feed_hold = 1;
+        signals.feed_hold = true;
     else if(flags & CYCLE_START_PIN)
-        signals.cycle_start = 1;
+        signals.cycle_start = true;
 
 	return signals;
 }
@@ -572,7 +573,7 @@ static void mcu_init (void) {
     setSerialReceiveCallback(hal.protocol_process_realtime);
     spindleSetState(SPINDLE_DISABLE, SPINDLE_PWM_OFF_VALUE);
     coolantSetState(COOLANT_STATE_DISABLE);
-    stepperSetDirOutputs(0);
+    stepperSetDirOutputs((axes_signals_t){0});
 
 }
 
@@ -664,10 +665,10 @@ static void stepper_pulse_isr (void) {
 #ifdef STEP_PULSE_DELAY
 	uint32_t iflags = TimerIntStatus(TIMER2_BASE, true);
 	TimerIntClear(TIMER2_BASE, iflags); // clear interrupt flags
-	GPIOPinWrite(STEP_PORT, HWSTEP_MASK, iflags & TIMER_TIMA_MATCH ? next_step_outbits : step_port_invert_mask);
+	stepperSetStepOutputs(iflags & TIMER_TIMA_MATCH ? next_step_outbits : step_port_invert_mask);
 #else
 	TimerIntClear(TIMER2_BASE, TIMER_TIMA_TIMEOUT); // clear interrupt flag
-	GPIOPinWrite(STEP_PORT, HWSTEP_MASK, step_port_invert_mask);
+	stepperSetStepOutputs(step_port_invert_mask);
 #endif
 }
 
@@ -676,10 +677,10 @@ static void software_debounce_isr (void) {
 
 	TimerIntClear(TIMER3_BASE, TIMER_TIMA_TIMEOUT); // clear interrupt flag
 
-	uint8_t state = limitsGetState();
+	axes_signals_t state = limitsGetState();
 
-	if(state) //TODO: add check for limit swicthes having same state as when limit_isr were invoked?
-		hal.limit_interrupt_callback(limitsGetState());
+	if(state.value) //TODO: add check for limit swicthes having same state as when limit_isr were invoked?
+		hal.limit_interrupt_callback(state);
 }
 #endif
 
