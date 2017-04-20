@@ -39,26 +39,17 @@
 #define STEPPER_DRIVER_PRESCALER 3
 
 static uint32_t ms_delayCycles, us_delayCycles;
-static uint8_t pulse_time;
-static axes_signals_t step_port_invert_mask, dir_port_invert_mask;
+static uint8_t pulse_time, pulse_delay;
+static bool pwmEnabled = false;
+static float pwm_gradient; // Precalulated value to speed up rpm to PWM conversions.
+static axes_signals_t step_port_invert_mask, dir_port_invert_mask, next_step_outbits;
 
-#ifdef VARIABLE_SPINDLE
-    static bool pwmEnabled = false;
-    static float pwm_gradient; // Precalulated value to speed up rpm to PWM conversions.
-#endif
-
-#ifdef STEP_PULSE_DELAY
-static axes_signals_t next_step_outbits, step_port_invert_mask, dir_port_invert_mask;
-#endif
-
-#ifndef ADAPTIVE_MULTI_AXIS_STEP_SMOOTHING
-	static uint16_t step_prescaler[4] = {
-		STEPPER_DRIVER_PRESCALER,
-		STEPPER_DRIVER_PRESCALER,
-		STEPPER_DRIVER_PRESCALER + 8,
-		STEPPER_DRIVER_PRESCALER + 64
-	};
-#endif
+static uint16_t step_prescaler[4] = {
+    STEPPER_DRIVER_PRESCALER,
+    STEPPER_DRIVER_PRESCALER,
+    STEPPER_DRIVER_PRESCALER + 8,
+    STEPPER_DRIVER_PRESCALER + 64
+};
 
 // Inverts the probe pin state depending on user settings and probing cycle mode.
 static uint8_t probe_invert_mask;
@@ -67,11 +58,11 @@ static uint8_t probe_invert_mask;
 
 static void stepper_driver_isr (void);
 static void stepper_pulse_isr (void);
+static void stepper_pulse_isr_delayed (void);
 static void limit_isr (void);
+static void limit_isr_debounced (void);
 static void control_isr (void);
-#ifdef ENABLE_SOFTWARE_DEBOUNCE
 static void software_debounce_isr (void);
-#endif
 
 // NOTE: driver_delay_ms may be called with 0, causes a hang on Tiva if passed on...
 
@@ -95,14 +86,15 @@ static void stepperEnable (bool on) {
 
 // Sets up for a step pulse and forces a stepper driver interrupt, called from st_wake_up()
 // NOTE: delay and pulse_time are # of microseconds
-static void stepperWakeUp (uint8_t delay) {
+static void stepperWakeUp ()
+{
 
-#ifdef STEP_PULSE_DELAY
-	pulse_time += delay;
-	TimerMatchSet(TIMER2_BASE, TIMER_A, pulse_time - delay);
-#endif
-	TimerLoadSet(TIMER2_BASE, TIMER_A, pulse_time - 1);
+    if(pulse_delay) {
+        pulse_time += pulse_delay;
+        TimerMatchSet(TIMER2_BASE, TIMER_A, pulse_time - pulse_delay);
+    }
 
+    TimerLoadSet(TIMER2_BASE, TIMER_A, pulse_time - 1);
 	TimerLoadSet(TIMER1_BASE, TIMER_A, 5000); 	// dummy...
 	TimerEnable(TIMER1_BASE, TIMER_A);
 	IntPendSet(INT_TIMER1A); 					// force immediate Timer1 interrupt
@@ -115,7 +107,12 @@ static void stepperGoIdle (void) {
 
 // Sets up stepper driver interrupt timeout, called from stepper_driver_interrupt_handler()
 static void stepperCyclesPerTick (uint32_t cycles_per_tick) {
-#ifndef ADAPTIVE_MULTI_AXIS_STEP_SMOOTHING
+	TimerLoadSet(TIMER1_BASE, TIMER_A, cycles_per_tick < (1UL << 16) /*< 65536 (4.1ms @ 16MHz)*/ ? cycles_per_tick : 0xffff /*Just set the slowest speed possible.*/);
+}
+
+// Sets up stepper driver interrupt timeout, called from stepper_driver_interrupt_handler()
+static void stepperCyclesPerTickPrescaled (uint32_t cycles_per_tick) {
+
     uint16_t prescaler;
     // Compute step timing and timer prescalar for normal step generation.
     if (cycles_per_tick < (1UL << 16)) // < 65536  (4.1ms @ 16MHz)
@@ -127,9 +124,8 @@ static void stepperCyclesPerTick (uint32_t cycles_per_tick) {
       prescaler = step_prescaler[3]; // prescaler: 64
       cycles_per_tick = cycles_per_tick >> 6;
     }
-	TimerPrescaleSet(TIMER1_BASE, TIMER_A, prescaler);
-#endif
-	TimerLoadSet(TIMER1_BASE, TIMER_A, cycles_per_tick < (1UL << 16) /*< 65536 (4.1ms @ 16MHz)*/ ? cycles_per_tick : 0xffff /*Just set the slowest speed possible.*/);
+    TimerPrescaleSet(TIMER1_BASE, TIMER_A, prescaler);
+    TimerLoadSet(TIMER1_BASE, TIMER_A, cycles_per_tick < (1UL << 16) /*< 65536 (4.1ms @ 16MHz)*/ ? cycles_per_tick : 0xffff /*Just set the slowest speed possible.*/);
 }
 
 // Set stepper pulse output pins, called from st_reset()
@@ -148,17 +144,18 @@ inline static void stepperSetDirOutputs (axes_signals_t dir_outbits) {
 
 // Sets stepper direction and pulse pins and starts a step pulse, called from stepper_driver_interrupt_handler()
 // When delayed pulse the step register is written in the step delay interrupt handler
-static void stepperPulseStart (axes_signals_t dir_outbits, axes_signals_t step_outbits, uint32_t spindle_pwm) {
-
+static void stepperPulseStart (axes_signals_t dir_outbits, axes_signals_t step_outbits, uint32_t spindle_pwm)
+{
     stepperSetDirOutputs(dir_outbits);
-
-#ifdef STEP_PULSE_DELAY
-	next_step_outbits = step_outbits; // Store out_bits
-#else  // Normal operation
 	stepperSetStepOutputs(step_outbits);
-#endif
-
 	TimerEnable(TIMER2_BASE, TIMER_A);
+}
+
+static void stepperPulseStartDelayed (axes_signals_t dir_outbits, axes_signals_t step_outbits, uint32_t spindle_pwm)
+{
+    stepperSetDirOutputs(dir_outbits);
+    next_step_outbits = step_outbits; // Store out_bits
+    TimerEnable(TIMER2_BASE, TIMER_A);
 }
 
 // Disable limit pins interrupt, called from mc_homing_cycle()
@@ -189,10 +186,8 @@ inline static controlsignals_t systemGetState (void) {
 
     if(flags & RESET_PIN)
         signals.reset = true;
-#ifdef ENABLE_SAFETY_DOOR_INPUT_PIN
     else if(flags & SAFETY_DOOR_PIN)
         signals.safety_door = true;
-#endif
     else if(flags & FEED_HOLD_PIN)
         signals.feed_hold = true;
     else if(flags & CYCLE_START_PIN)
@@ -218,130 +213,127 @@ bool probeGetState (void) {
     return (((uint8_t)GPIOPinRead(PROBE_PORT, PROBE_MASK)) ^ probe_invert_mask) != 0;
 }
 
-// Called by spindle_set_state() and step segment generator. Keep routine small and efficient.
-uint32_t spindleComputePWMValue(float rpm) // 328p PWM register is 8-bit.
+// Static spindle (off, on cw & on ccw)
+
+inline static void spindleOff ()
 {
-  uint32_t pwm_value;
-  rpm *= (0.010f*sys.spindle_speed_ovr); // Scale by spindle speed override value.
-  // Calculate PWM register value based on rpm max/min settings and programmed rpm.
-  if ((settings.rpm_min >= settings.rpm_max) || (rpm >= settings.rpm_max)) {
-    // No PWM range possible. Set simple on/off spindle control pin state.
-    sys.spindle_speed = settings.rpm_max;
-    pwm_value = SPINDLE_PWM_MAX_VALUE;
-  } else if (rpm <= settings.rpm_min) {
-    if (rpm == 0.0f) { // S0 disables spindle
-      sys.spindle_speed = 0.0f;
-      pwm_value = SPINDLE_PWM_OFF_VALUE;
-    } else { // Set minimum PWM output
-      sys.spindle_speed = settings.rpm_min;
-      pwm_value = SPINDLE_PWM_MIN_VALUE;
-    }
-  } else {
-    // Compute intermediate PWM value with linear spindle speed model.
-    // NOTE: A nonlinear model could be installed here, if required, but keep it VERY light-weight.
-    sys.spindle_speed = rpm;
-    pwm_value = (uint32_t)floorf((rpm-settings.rpm_min)*pwm_gradient) + SPINDLE_PWM_MIN_VALUE;
-  }
-  return(pwm_value);
+    if(hal.driver_cap.spindle_dir)
+        GPIOPinWrite(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN, settings.flags.invert_spindle_enable ? SPINDLE_DIRECTION_PIN : 0);
+    else
+        GPIOPinWrite(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN,  settings.flags.invert_spindle_enable ? SPINDLE_ENABLE_PIN : 0);
+}
+
+inline static void spindleOn ()
+{
+    if(hal.driver_cap.spindle_dir)
+        GPIOPinWrite(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN, settings.flags.invert_spindle_enable ? 0 : SPINDLE_DIRECTION_PIN);
+    else
+        GPIOPinWrite(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN,  settings.flags.invert_spindle_enable ? 0 : SPINDLE_ENABLE_PIN );
 }
 
 // Start or stop spindle, called from spindle_run() and protocol_execute_realtime()
-static void spindleSetState(uint8_t state, float rpm) {
+static void spindleSetState (uint8_t state, float rpm) {
 
-#ifdef VARIABLE_SPINDLE
-
-	if (state == SPINDLE_DISABLE || rpm == 0.0f) {
-#else
-	if (state == SPINDLE_DISABLE) {
-#endif
-#ifdef USE_SPINDLE_DIR_AS_ENABLE_PIN
-  #ifdef INVERT_SPINDLE_ENABLE_PIN
-	GPIOPinWrite(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN, SPINDLE_ENABLE_PIN);
-  #else
-	GPIOPinWrite(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN, 0);
-  #endif
-#else
-  #ifdef INVERT_SPINDLE_ENABLE_PIN
-	GPIOPinWrite(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN, SPINDLE_ENABLE_PIN);
-  #else
-	GPIOPinWrite(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN, 0);
-  #endif
-#endif
-#ifdef VARIABLE_SPINDLE
-	pwmEnabled = false;
-	PWMGenDisable(SPINDLEPWM, SPINDLEPWM_GEN);
-#endif
-
-	} else {
-
-#ifndef USE_SPINDLE_DIR_AS_ENABLE_PIN
-		GPIOPinWrite(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN, state == SPINDLE_ENABLE_CW ? 0 : SPINDLE_DIRECTION_PIN);
-#endif
-
-	}
+    if (state == SPINDLE_DISABLE)
+        spindleOff();
+    else {
+        if(!hal.driver_cap.spindle_dir)
+            GPIOPinWrite(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN, state == SPINDLE_ENABLE_CW ? 0 : SPINDLE_DIRECTION_PIN);
+    }
 }
 
-static uint8_t spindleGetState (void) {
+// Variable spindle
 
-    uint8_t state = SPINDLE_STATE_DISABLE;
+// Called by spindle_set_state() and step segment generator. Keep routine small and efficient.
+uint32_t spindleComputePWMValue (float rpm) // 328p PWM register is 8-bit.
+{
+    uint32_t pwm_value;
 
- #ifdef VARIABLE_SPINDLE
+    rpm *= (0.010f * sys.spindle_speed_ovr); // Scale by spindle speed override value.
+    // Calculate PWM register value based on rpm max/min settings and programmed rpm.
+    if ((settings.rpm_min >= settings.rpm_max) || (rpm >= settings.rpm_max)) {
+        // No PWM range possible. Set simple on/off spindle control pin state.
+        sys.spindle_speed = settings.rpm_max;
+        pwm_value = SPINDLE_PWM_MAX_VALUE;
+    } else if (rpm <= settings.rpm_min) {
+        if (rpm == 0.0f) { // S0 disables spindle
+            sys.spindle_speed = 0.0f;
+            pwm_value = SPINDLE_PWM_OFF_VALUE;
+        } else { // Set minimum PWM output
+            sys.spindle_speed = settings.rpm_min;
+            pwm_value = SPINDLE_PWM_MIN_VALUE;
+        }
+    } else {
+        // Compute intermediate PWM value with linear spindle speed model.
+        // NOTE: A nonlinear model could be installed here, if required, but keep it VERY light-weight.
+        sys.spindle_speed = rpm;
+        pwm_value = (uint32_t)floorf((rpm - settings.rpm_min) * pwm_gradient) + SPINDLE_PWM_MIN_VALUE;
+    }
 
-  #ifdef USE_SPINDLE_DIR_AS_ENABLE_PIN
-  // No spindle direction output pin.
-   #ifdef INVERT_SPINDLE_ENABLE_PIN
-    if (!GPIOPinRead(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN))
-        state = SPINDLE_STATE_CW;
-   #else
-    if (GPIOPinRead(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN))
-        state = SPINDLE_STATE_CW);
-   #endif
-  #else
-    if (pwmEnabled) // Check if PWM is enabled.
-        state = GPIOPinRead(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN) ? SPINDLE_STATE_CCW : SPINDLE_STATE_CW;
-  #endif
+    return pwm_value;
+}
 
- #else
-  #ifdef INVERT_SPINDLE_ENABLE_PIN
-    if (!GPIOPinRead(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN))
-  #else
-    if (GPIOPinRead(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN))
-  #endif
-    state = GPIOPinRead(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN) ? SPINDLE_STATE_CCW : SPINDLE_STATE_CW;
+static uint32_t spindleSetSpeed (uint32_t pwm_value) {
 
- #endif
+    if (pwm_value == hal.spindle_pwm_off) {
+        pwmEnabled = false;
+        if(settings.flags.spindle_disable_with_zero_speed)
+            spindleOff();
+        PWMGenDisable(SPINDLEPWM, SPINDLEPWM_GEN); // Disable PWM. Output voltage is zero.
+     } else {
+        if(!pwmEnabled)
+            spindleOn();
+        pwmEnabled = true;
+        PWMGenPeriodSet(SPINDLEPWM, SPINDLEPWM_GEN, SPINDLE_PWM_MAX_VALUE);
+        PWMPulseWidthSet(SPINDLEPWM, SPINDLEPWM_OUT, pwm_value);
+        PWMGenEnable(SPINDLEPWM, SPINDLEPWM_GEN); // Ensure PWM output is enabled.
+    }
+
+    return pwm_value;
+}
+
+// Start or stop spindle, called from spindle_run() and protocol_execute_realtime()
+static void spindleSetStateVariable (uint8_t state, float rpm) {
+
+    if (state == SPINDLE_DISABLE || rpm == 0.0f) {
+
+        if(hal.driver_cap.spindle_dir)
+            GPIOPinWrite(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN, settings.flags.invert_spindle_enable ? SPINDLE_DIRECTION_PIN : 0);
+        else
+            GPIOPinWrite(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN,  settings.flags.invert_spindle_enable ? SPINDLE_ENABLE_PIN : 0);
+
+        pwmEnabled = false;
+        PWMGenDisable(SPINDLEPWM, SPINDLEPWM_GEN);
+
+    } else {
+
+        if(hal.driver_cap.spindle_dir)
+            GPIOPinWrite(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN, settings.flags.invert_spindle_enable ? 0 : SPINDLE_DIRECTION_PIN);
+        else {
+            GPIOPinWrite(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN, state == SPINDLE_ENABLE_CW ? 0 : SPINDLE_DIRECTION_PIN);
+            GPIOPinWrite(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN,  settings.flags.invert_spindle_enable ? 0 : SPINDLE_ENABLE_PIN);
+        }
+    }
+}
+
+static spindle_state_t spindleGetState (void) {
+
+    spindle_state_t state = Spindle_Off;
+
+    if(hal.driver_cap.spindle_dir) {
+        if(GPIOPinRead(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN) == settings.flags.invert_spindle_enable ? 0 : SPINDLE_DIRECTION_PIN)
+            state = Spindle_CW;
+    } else if((GPIOPinRead(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN) == settings.flags.invert_spindle_enable ? 0 : SPINDLE_ENABLE_PIN) || pwmEnabled) {
+        if(GPIOPinRead(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN))
+             state = Spindle_CCW;
+        else
+             state = Spindle_CW;
+    }
 
     return state;
 }
 
-inline static uint32_t spindleSetSpeed (uint32_t pwm_value) {
-
-    #ifdef SPINDLE_ENABLE_OFF_WITH_ZERO_SPEED
-      if (pwm_value == SPINDLE_PWM_OFF_VALUE) {
-          spindleSetState(SPINDLE_DISABLE, SPINDLE_PWM_OFF_VALUE);
-      } else {
-          pwmEnabled = true;
-          PWMGenEnable(SPINDLEPWM, SPINDLEPWM_GEN);
- 		#ifdef INVERT_SPINDLE_ENABLE_PIN
-			GPIOPinWrite(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN, SPINDLE_ENABLE_PIN);
-		#else
-			GPIOPinWrite(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN, 0);
-		#endif
-      }
-    #else
-      if (pwm_value == SPINDLE_PWM_OFF_VALUE) {
-          pwmEnabled = false;
-          PWMGenDisable(SPINDLEPWM, SPINDLEPWM_GEN); // Disable PWM. Output voltage is zero.
-      } else {
-          pwmEnabled = true;
-          PWMGenPeriodSet(SPINDLEPWM, SPINDLEPWM_GEN, SPINDLE_PWM_MAX_VALUE); // 2KHz on Arduino
-          PWMPulseWidthSet(SPINDLEPWM, SPINDLEPWM_OUT, pwm_value);
-          PWMGenEnable(SPINDLEPWM, SPINDLEPWM_GEN); // Ensure PWM output is enabled.
-      }
-    #endif
-
-    return pwm_value;
-}
+// end spindle code
 
 // Start/stop coolant (and mist if enabled), called by coolant_run() and protocol_execute_realtime()
 static void coolantSetState (uint8_t mode)
@@ -350,60 +342,35 @@ static void coolantSetState (uint8_t mode)
 	switch(mode) {
 
 		case COOLANT_FLOOD_ENABLE:
-		  #ifdef INVERT_COOLANT_FLOOD_PIN
-			GPIOPinWrite(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN, 0);
-		  #else
-			GPIOPinWrite(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN, COOLANT_FLOOD_PIN);
-		  #endif
+            GPIOPinWrite(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN, settings.flags.invert_flood_pin ? 0 : COOLANT_FLOOD_PIN);
 			break;
 
 		case COOLANT_MIST_ENABLE:
-		  #ifdef INVERT_COOLANT_MIST_PIN
-			GPIOPinWrite(COOLANT_MIST_PORT, COOLANT_MIST_PIN, 0);
-		  #else
-			GPIOPinWrite(COOLANT_MIST_PORT, COOLANT_MIST_PIN, COOLANT_MIST_PIN);
-		  #endif
+            GPIOPinWrite(COOLANT_MIST_PORT, COOLANT_MIST_PIN, settings.flags.invert_mist_pin ? 0 : COOLANT_MIST_PIN);
 			break;
 
-		default:
-		#ifdef INVERT_COOLANT_FLOOD_PIN
-			GPIOPinWrite(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN, COOLANT_FLOOD_PIN);
-		#else
-			GPIOPinWrite(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN, 0);
-		#endif
-
-		#ifdef INVERT_COOLANT_MIST_PIN
-			GPIOPinWrite(COOLANT_MIST_PORT, COOLANT_MIST_PIN, COOLANT_MIST_PIN);
-		#else
-			GPIOPinWrite(COOLANT_MIST_PORT, COOLANT_MIST_PIN, 0);
-		#endif
+		default: // off
+			GPIOPinWrite(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN, settings.flags.invert_flood_pin ? COOLANT_FLOOD_PIN : 0);
+			GPIOPinWrite(COOLANT_MIST_PORT, COOLANT_MIST_PIN, settings.flags.invert_mist_pin ? COOLANT_MIST_PIN : 0);
 			break;
 
 	}
 }
 
-static uint8_t coolantGetState (void) {
+static coolant_state_t coolantGetState (void) {
 
-	uint8_t state = 0;
+	coolant_state_t state = {0};
 
-  #ifdef INVERT_COOLANT_FLOOD_PIN
-	state = GPIOPinRead(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN) == 0 ? COOLANT_STATE_FLOOD : 0;
-  #else
-	state = GPIOPinRead(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN) ? COOLANT_STATE_FLOOD : 0;
-  #endif
+	state.flood = settings.flags.invert_flood_pin
+	               ? GPIOPinRead(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN) == 0
+                   : GPIOPinRead(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN) != 0;
 
-  #ifdef INVERT_COOLANT_MIST_PIN
-	state |= GPIOPinRead(COOLANT_MIST_PORT, COOLANT_MIST_PIN) == 0 ? COOLANT_STATE_MIST : 0;
-  #else
-	state |= GPIOPinRead(COOLANT_MIST_PORT, COOLANT_MIST_PIN) ? COOLANT_STATE_MIST : 0;
-  #endif
+	state.mist  = settings.flags.invert_mist_pin
+	               ? GPIOPinRead(COOLANT_MIST_PORT, COOLANT_MIST_PIN) == 0
+	               : GPIOPinRead(COOLANT_MIST_PORT, COOLANT_MIST_PIN) != 0;
 
     return state;
 
-}
-
-static uint16_t serialRxBuffer (void) {
-    return RX_BUFFER_SIZE;
 }
 
 // Callback to inform settings has been changed, called by settings_store_global_setting() and local mcu_init()
@@ -419,6 +386,7 @@ void settings_changed (settings_t *settings) {
 	// Generates the step and direction port invert masks used in the Stepper Interrupt Driver.
 
     pulse_time = settings->pulse_microseconds;
+    pulse_delay = settings->pulse_delay_microseconds;
     step_port_invert_mask = settings->step_invert_mask;
     dir_port_invert_mask = settings->dir_invert_mask;
     pwm_gradient = SPINDLE_PWM_RANGE / (settings->rpm_max - settings->rpm_min);
@@ -426,19 +394,27 @@ void settings_changed (settings_t *settings) {
 //    curr_dir_outbits = 0xFF; // "forget" current dir flags
 }
 
-// Helper functions for setting/clearing/inverting individual bits atomically (uninterruptable) TODO: switch to bit-banding?
-static void bitsSetAtomic (volatile uint8_t *value, uint8_t bits) {
+// Helper functions for setting/clearing/inverting individual bits atomically (uninterruptable)
+static void bitsSetAtomic (volatile uint8_t *ptr, uint8_t bits) {
 	IntMasterDisable();
-	*value |= bits;
+	*ptr |= bits;
 	IntMasterEnable();
 }
 
-uint8_t bitsClearAtomic (volatile uint8_t *value, uint8_t bits) {
+uint8_t bitsClearAtomic (volatile uint8_t *ptr, uint8_t bits) {
     IntMasterDisable();
-    uint8_t prev = *value;
-	*value &= ~bits;
+    uint8_t prev = *ptr;
+	*ptr &= ~bits;
 	IntMasterEnable();
 	return prev;
+}
+
+uint8_t valueSetAtomic (volatile uint8_t *ptr, uint8_t value) {
+    IntMasterDisable();
+    uint8_t prev = *ptr;
+    *ptr = value;
+    IntMasterEnable();
+    return prev;
 }
 
 // Initializes MCU peripherals for Grbl use TODO: rename?
@@ -454,13 +430,6 @@ static void mcu_init (void) {
 	SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
 	SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER1);
 	SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER2);
-#ifdef ENABLE_SOFTWARE_DEBOUNCE
-	SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER3);
-#endif
-#ifdef VARIABLE_SPINDLE
-	SysCtlPWMClockSet(SYSCTL_PWMDIV_8);
-    SysCtlPeripheralEnable(SYSCTL_PERIPH_PWM1);
-#endif
 
     SysCtlDelay(26); // wait a bit for peripherals to wake up
 
@@ -468,15 +437,15 @@ static void mcu_init (void) {
 
 	GPIOPinTypeGPIOInput(CONTROL_PORT, HWCONTROL_MASK);
 	GPIOIntRegister(CONTROL_PORT, &control_isr); 		     // Register a call-back funcion for interrupt
-  #ifdef DISABLE_CONTROL_PIN_PULL_UP
-	GPIOPadConfigSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPD); //Enable weak pull-downs
-	GPIOIntTypeSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_RISING_EDGE); // Enable specific pins of the Pin Change Interrupt
-  #else
-	GPIOPadConfigSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU); //Enable weak pull-ups
-	GPIOIntTypeSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_FALLING_EDGE); // Enable specific pins of the Pin Change Interrupt
-  #endif
+    if(hal.driver_cap.control_pull_up) {
+        GPIOPadConfigSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU); //Enable weak pull-ups
+        GPIOIntTypeSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_FALLING_EDGE); // Enable specific pins of the Pin Change Interrupt
+    } else {
+        GPIOPadConfigSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPD); //Enable weak pull-downs
+        GPIOIntTypeSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_RISING_EDGE); // Enable specific pins of the Pin Change Interrupt
+    }
 	GPIOIntClear(CONTROL_PORT, HWCONTROL_MASK);					 // Clear any pending interrupt
-	GPIOIntEnable(CONTROL_PORT, HWCONTROL_MASK);                   // and enable Pin Change Interrupt
+	GPIOIntEnable(CONTROL_PORT, HWCONTROL_MASK);                 // and enable Pin Change Interrupt
 
   // Stepper init
 
@@ -503,70 +472,78 @@ static void mcu_init (void) {
 	TimerConfigure(TIMER2_BASE, TIMER_CFG_SPLIT_PAIR|TIMER_CFG_A_ONE_SHOT);
 	IntPrioritySet(INT_TIMER2A, 0x00); // highest priority - higher than for Timer1 (which sets the step-dir output)
 	TimerControlStall(TIMER2_BASE, TIMER_A, true); //timer2 will stall in debug mode
-	TimerIntRegister(TIMER2_BASE, TIMER_A, stepper_pulse_isr);
 	TimerIntClear(TIMER2_BASE, 0xFFFF);
 	IntPendClear(INT_TIMER2A);
 	TimerPrescaleSet(TIMER2_BASE, TIMER_A, 79); // for 1uS per count
-#ifdef STEP_PULSE_DELAY
-	TimerIntEnable(TIMER2_BASE, TIMER_TIMA_TIMEOUT|TIMER_TIMA_MATCH);
-#else
-	TimerIntEnable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
-#endif
 
-#ifdef ENABLE_SOFTWARE_DEBOUNCE
-    IntPrioritySet(INT_TIMER3A, 0x40); // lower priority than for Timer2 (which resets the step-dir signal)
-	TimerConfigure(TIMER3_BASE, TIMER_CFG_SPLIT_PAIR|TIMER_CFG_A_ONE_SHOT);
-	TimerControlStall(TIMER3_BASE, TIMER_A, true); //timer2 will stall in debug mode
-	TimerIntRegister(TIMER3_BASE, TIMER_A, software_debounce_isr);
-	TimerIntClear(TIMER3_BASE, 0xFFFF);
-	IntPendClear(INT_TIMER3A);
-	TimerPrescaleSet(TIMER3_BASE, TIMER_A, 79); // configure for 1us per count
-	TimerLoadSet(TIMER3_BASE, TIMER_A, 32000);  // and for a total of 32ms
-	TimerIntEnable(TIMER3_BASE, TIMER_TIMA_TIMEOUT);
-#endif
+	if(hal.driver_cap.step_pulse_delay) {
+	    TimerIntRegister(TIMER2_BASE, TIMER_A, stepper_pulse_isr_delayed);
+	    TimerIntEnable(TIMER2_BASE, TIMER_TIMA_TIMEOUT|TIMER_TIMA_MATCH);
+	    hal.stepper_pulse_start = &stepperPulseStartDelayed;
+	} else {
+	    TimerIntRegister(TIMER2_BASE, TIMER_A, stepper_pulse_isr);
+	    TimerIntEnable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+	}
+
+	if(hal.driver_cap.software_debounce) {
+	    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER3);
+	    SysCtlDelay(26); // wait a bit for peripherals to wake up
+	    IntPrioritySet(INT_TIMER3A, 0x40); // lower priority than for Timer2 (which resets the step-dir signal)
+        TimerConfigure(TIMER3_BASE, TIMER_CFG_SPLIT_PAIR|TIMER_CFG_A_ONE_SHOT);
+        TimerControlStall(TIMER3_BASE, TIMER_A, true); //timer2 will stall in debug mode
+        TimerIntRegister(TIMER3_BASE, TIMER_A, software_debounce_isr);
+        TimerIntClear(TIMER3_BASE, 0xFFFF);
+        IntPendClear(INT_TIMER3A);
+        TimerPrescaleSet(TIMER3_BASE, TIMER_A, 79); // configure for 1us per count
+        TimerLoadSet(TIMER3_BASE, TIMER_A, 32000);  // and for a total of 32ms
+        TimerIntEnable(TIMER3_BASE, TIMER_TIMA_TIMEOUT);
+    }
 
   // Limits init
 
 	GPIOPinTypeGPIOInput(LIMIT_PORT, HWLIMIT_MASK);
-	GPIOIntRegister(LIMIT_PORT, limit_isr); 		     // Register a call-back funcion for interrupt
-#ifdef DISABLE_LIMIT_PIN_PULL_UP
-	GPIOPadConfigSet(LIMIT_PORT, HWLIMIT_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPD); //Enable weak pull-downs
-	GPIOIntTypeSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_RISING_EDGE); // Enable specific pins of the Pin Change Interrupt
-#else
-	GPIOPadConfigSet(LIMIT_PORT, HWLIMIT_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU); //Enable weak pull-ups
-	GPIOIntTypeSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_FALLING_EDGE); // Enable specific pins of the Pin Change Interrupt
-#endif
+	GPIOIntRegister(LIMIT_PORT, hal.driver_cap.software_debounce ? limit_isr_debounced : limit_isr); // Register a call-back funcion for interrupt
+	if(hal.driver_cap.limits_pull_up) {
+        GPIOPadConfigSet(LIMIT_PORT, HWLIMIT_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPD); //Enable weak pull-downs
+        GPIOIntTypeSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_RISING_EDGE); // Enable specific pins of the Pin Change Interrupt
+	} else {
+        GPIOPadConfigSet(LIMIT_PORT, HWLIMIT_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU); //Enable weak pull-ups
+        GPIOIntTypeSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_FALLING_EDGE); // Enable specific pins of the Pin Change Interrupt
+	}
 
   // Probe init
 
 	GPIOPinTypeGPIOInput(PROBE_PORT, PROBE_MASK);
-#ifdef DISABLE_PROBE_PIN_PULL_UP
-	GPIOPadConfigSet(LIMIT_PORT, PROBE_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPD); //Enable weak pull-downs
-#else
-	GPIOPadConfigSet(PROBE_PORT, PROBE_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU); //Enable weak pull-ups
-#endif
+    if(hal.driver_cap.probe_pull_up)
+        GPIOPadConfigSet(PROBE_PORT, PROBE_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU); //Enable weak pull-ups
+	else
+        GPIOPadConfigSet(LIMIT_PORT, PROBE_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPD); //Enable weak pull-downs
 
   // Spindle init
 
 	GPIOPinTypeGPIOOutput(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN);
 	GPIOPinTypeGPIOOutput(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN);
 
-#ifdef VARIABLE_SPINDLE
-    GPIOPinConfigure(SPINDLEPWM_MAP);
-    GPIOPinTypePWM(SPINDLEPPORT, SPINDLEPPIN);
-    GPIOPadConfigSet(SPINDLEPPORT, SPINDLEPPIN, GPIO_STRENGTH_8MA, GPIO_PIN_TYPE_STD);
-    PWMGenConfigure(SPINDLEPWM, SPINDLEPWM_GEN, PWM_GEN_MODE_DOWN|PWM_GEN_MODE_GEN_SYNC_LOCAL);
-	PWMGenPeriodSet(SPINDLEPWM, SPINDLEPWM_GEN, PWM_MAX_VALUE);
-    PWMOutputState(SPINDLEPWM, SPINDLEPWM_OUT_BIT, true);
-
-#endif
+	if(hal.driver_cap.variable_spindle) {
+	    SysCtlPWMClockSet(SYSCTL_PWMDIV_8);
+	    SysCtlPeripheralEnable(SYSCTL_PERIPH_PWM1);
+        SysCtlDelay(26); // wait a bit for peripherals to wake up
+	    GPIOPinConfigure(SPINDLEPWM_MAP);
+        GPIOPinTypePWM(SPINDLEPPORT, SPINDLEPPIN);
+        GPIOPadConfigSet(SPINDLEPPORT, SPINDLEPPIN, GPIO_STRENGTH_8MA, GPIO_PIN_TYPE_STD);
+        PWMGenConfigure(SPINDLEPWM, SPINDLEPWM_GEN, PWM_GEN_MODE_DOWN|PWM_GEN_MODE_GEN_SYNC_LOCAL);
+        PWMGenPeriodSet(SPINDLEPWM, SPINDLEPWM_GEN, PWM_MAX_VALUE);
+        PWMOutputState(SPINDLEPWM, SPINDLEPWM_OUT_BIT, true);
+	} else
+	    hal.spindle_set_status = &spindleSetState;
 
   // Coolant init
 
 	GPIOPinTypeGPIOOutput(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN);
-#ifdef ENABLE_M7
 	GPIOPinTypeGPIOOutput(COOLANT_MIST_PORT, COOLANT_MIST_PIN);
-#endif
+
+	if(hal.driver_cap.amass_level == 0)
+	    hal.stepper_cycles_per_tick = &stepperCyclesPerTickPrescaled;
 
   // Set defaults
 
@@ -592,10 +569,13 @@ bool driver_init (void) {
 
 	serialInit();
 
-	hal.initMCU = &mcu_init;
+	hal.driver_setup = &mcu_init;
 	hal.f_step_timer = 20000000;
+	hal.rx_buffer_size = RX_BUFFER_SIZE;
 	hal.delay_ms = &driver_delay_ms;
 	hal.delay_us = &driver_delay_us;
+    hal.settings_changed = &settings_changed;
+
 	hal.stepper_wake_up = &stepperWakeUp;
 	hal.stepper_go_idle = &stepperGoIdle;
 	hal.stepper_enable = &stepperEnable;
@@ -603,38 +583,57 @@ bool driver_init (void) {
 	hal.stepper_set_directions = &stepperSetDirOutputs;
 	hal.stepper_cycles_per_tick = &stepperCyclesPerTick;
 	hal.stepper_pulse_start = &stepperPulseStart;
+
 	hal.limits_enable = &limitsEnable;
 	hal.limits_get_state = &limitsGetState;
+
 	hal.coolant_set_state = &coolantSetState;
 	hal.coolant_get_state = &coolantGetState;
+
 	hal.probe_get_state = &probeGetState;
 	hal.probe_configure_invert_mask = &probeConfigureInvertMask;
-	hal.spindle_set_state = &spindleSetState;
+
+	hal.spindle_set_status = &spindleSetStateVariable;
 	hal.spindle_get_state = &spindleGetState;
 	hal.spindle_set_speed = &spindleSetSpeed;
 	hal.spindle_compute_pwm_value = &spindleComputePWMValue;
+
 	hal.system_control_get_state = &systemGetState;
+
     hal.serial_read = &serialGetC;
     hal.serial_write = (void (*)(uint8_t))&serialPutC;
     hal.serial_write_string = &serialWriteS;
-    hal.serial_get_rx_buffer_size = &serialRxBuffer;
     hal.serial_get_rx_buffer_available = &serialRxFree;
     hal.serial_reset_read_buffer = &serialRxFlush;
     hal.serial_cancel_read_buffer = &serialRxCancel;
-	hal.eeprom_get_char = &eepromGetChar;
-	hal.eeprom_put_char = &eepromPutChar;
-	hal.memcpy_to_eeprom_with_checksum = &eepromWriteBlockWithChecksum;
-	hal.memcpy_from_eeprom_with_checksum = &eepromReadBlockWithChecksum;
-	hal.settings_changed = &settings_changed;
+
+    hal.eeprom.type = EEPROM_Physical;
+	hal.eeprom.get_char = &eepromGetChar;
+	hal.eeprom.put_char = &eepromPutChar;
+	hal.eeprom.memcpy_to_with_checksum = &eepromWriteBlockWithChecksum;
+	hal.eeprom.memcpy_from_with_checksum = &eepromReadBlockWithChecksum;
+
 	hal.set_bits_atomic = &bitsSetAtomic;
 	hal.clear_bits_atomic = &bitsClearAtomic;
+	hal.set_value_atomic = &valueSetAtomic;
+
     hal.userdefined_mcode_check = &userMCodeCheck;
     hal.userdefined_mcode_validate = &userMCodeValidate;
     hal.userdefined_mcode_execute = &userMCodeExecute;
-    hal.hasEEPROM = true;
 
-// no need to move version check before init - compiler will fail any mismatch for existing entries
-	return hal.version == 1;
+  // driver capabilities, used for announcing and negotiating (with Grbl) driver functionality
+
+    hal.driver_cap.variable_spindle = true;
+    hal.driver_cap.mist_control = true;
+    hal.driver_cap.software_debounce = true;
+    hal.driver_cap.step_pulse_delay = true;
+    hal.driver_cap.amass_level = 3;
+    hal.driver_cap.control_pull_up = true;
+    hal.driver_cap.limits_pull_up = true;
+    hal.driver_cap.probe_pull_up = true;
+
+    // no need to move version check before init - compiler will fail any mismatch for existing entries
+	return hal.version == 3;
 }
 
 /* interrupt handlers */
@@ -660,19 +659,19 @@ static void stepper_driver_isr (void) {
 // a step. This ISR resets the motor port after a short period (settings.pulse_microseconds)
 // completing one step cycle.
 // NOTE: TivaC has a shared interrupt for match and timeout
-static void stepper_pulse_isr (void) {
-
-#ifdef STEP_PULSE_DELAY
-	uint32_t iflags = TimerIntStatus(TIMER2_BASE, true);
-	TimerIntClear(TIMER2_BASE, iflags); // clear interrupt flags
-	stepperSetStepOutputs(iflags & TIMER_TIMA_MATCH ? next_step_outbits : step_port_invert_mask);
-#else
+static void stepper_pulse_isr (void)
+{
 	TimerIntClear(TIMER2_BASE, TIMER_TIMA_TIMEOUT); // clear interrupt flag
 	stepperSetStepOutputs(step_port_invert_mask);
-#endif
 }
 
-#ifdef ENABLE_SOFTWARE_DEBOUNCE
+static void stepper_pulse_isr_delayed (void)
+{
+    uint32_t iflags = TimerIntStatus(TIMER2_BASE, true);
+    TimerIntClear(TIMER2_BASE, iflags); // clear interrupt flags
+    stepperSetStepOutputs(iflags & TIMER_TIMA_MATCH ? next_step_outbits : step_port_invert_mask);
+}
+
 static void software_debounce_isr (void) {
 
 	TimerIntClear(TIMER3_BASE, TIMER_TIMA_TIMEOUT); // clear interrupt flag
@@ -682,7 +681,6 @@ static void software_debounce_isr (void) {
 	if(state.value) //TODO: add check for limit swicthes having same state as when limit_isr were invoked?
 		hal.limit_interrupt_callback(state);
 }
-#endif
 
 static void limit_isr (void) {
 
@@ -690,14 +688,20 @@ static void limit_isr (void) {
 
 	if(iflags) {
 		GPIOIntClear(LIMIT_PORT, iflags);
-#ifdef ENABLE_SOFTWARE_DEBOUNCE
-		// TODO: disable interrups here and reenable in software_debounce_isr?
+		hal.limit_interrupt_callback(limitsGetState());
+	}
+}
+
+static void limit_isr_debounced (void) {
+
+    uint32_t iflags = GPIOIntStatus(LIMIT_PORT, true) & HWLIMIT_MASK;
+
+    if(iflags) {
+        GPIOIntClear(LIMIT_PORT, iflags);
+        // TODO: disable interrups here and reenable in software_debounce_isr?
         TimerLoadSet(TIMER3_BASE, TIMER_A, 32000);  // 32ms
         TimerEnable(TIMER3_BASE, TIMER_A);
-#else
-		hal.limit_interrupt_callback(limitsGetState());
-#endif
-	}
+    }
 }
 
 static void control_isr (void) {

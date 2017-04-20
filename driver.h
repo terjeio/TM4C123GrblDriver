@@ -27,7 +27,6 @@
 //#define RX_BUFFER_SIZE		256
 //#define TX_BUFFER_SIZE		128
 //#define BLOCK_BUFFER_SIZE	36
-// LINE_BUFFER_SIZE must be a multiple of 4 - 1 (see settings.h - EEPROM writes has to be word-aligned)
 
 //
 

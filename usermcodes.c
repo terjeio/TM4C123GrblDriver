@@ -41,22 +41,22 @@ uint8_t userMCodeCheck (uint8_t mcode) {
 // userMCodeValidate - validate parameters, return STATUS_OK when ok
 //
 
-uint8_t userMCodeValidate (parser_block_t *gc_block, uint16_t *value_words) {
+status_code_t userMCodeValidate (parser_block_t *gc_block, uint16_t *value_words) {
 
-    uint8_t state = STATUS_GCODE_VALUE_WORD_MISSING;
+    status_code_t state = Status_GcodeValueWordMissing;
 
     switch(gc_block->user_defined_mcode) {
 
         case 100:
             if(bit_istrue(*value_words, bit(WORD_P))) {
-                state = STATUS_OK;
+                state = Status_OK;
                 bit_false(*value_words, bit(WORD_P));
             }
             break;
 
         case 101:
             if(bit_istrue(*value_words, bit(WORD_P))) {
-                state = STATUS_OK;
+                state = Status_OK;
                 gc_block->user_defined_mcode_sync = true;
                 bit_false(*value_words, bit(WORD_P));
             }
