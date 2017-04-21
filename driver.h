@@ -90,13 +90,11 @@
 #define CYCLE_START_PIN		GPIO_PIN_2
 #define SAFETY_DOOR_PIN		GPIO_PIN_3
 #define HWCONTROL_MASK		(RESET_PIN|FEED_HOLD_PIN|CYCLE_START_PIN|SAFETY_DOOR_PIN)
-#define CONTROL_INVERT_MASK HWCONTROL_MASK // May be re-defined to only invert certain control pins.
 
 // Define probe switch input pin.
 #define PROBE_PERIPH	SYSCTL_PERIPH_GPIOA
 #define PROBE_PORT		GPIO_PORTA_BASE
 #define PROBE_PIN		GPIO_PIN_7
-#define PROBE_MASK		PROBE_PIN
 
 // Start of PWM & Stepper Enabled Spindle
 #ifdef VARIABLE_SPINDLE

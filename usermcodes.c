@@ -48,17 +48,17 @@ status_code_t userMCodeValidate (parser_block_t *gc_block, uint16_t *value_words
     switch(gc_block->user_defined_mcode) {
 
         case 100:
-            if(bit_istrue(*value_words, bit(WORD_P))) {
+            if(bit_istrue(*value_words, bit(Word_P))) {
                 state = Status_OK;
-                bit_false(*value_words, bit(WORD_P));
+                bit_false(*value_words, bit(Word_P));
             }
             break;
 
         case 101:
-            if(bit_istrue(*value_words, bit(WORD_P))) {
+            if(bit_istrue(*value_words, bit(Word_P))) {
                 state = Status_OK;
                 gc_block->user_defined_mcode_sync = true;
-                bit_false(*value_words, bit(WORD_P));
+                bit_false(*value_words, bit(Word_P));
             }
             break;
     }

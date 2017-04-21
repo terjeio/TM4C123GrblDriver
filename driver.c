@@ -171,18 +171,20 @@ static void limitsEnable (bool on) {
 // number in bit position, i.e. Z_AXIS is (1<<2) or bit 2, and Y_AXIS is (1<<1) or bit 1.
 inline static axes_signals_t limitsGetState() {
 
-	uint8_t pins = (uint8_t)GPIOPinRead(LIMIT_PORT, HWLIMIT_MASK);
+    axes_signals_t signals;
 
-	if (settings.flags.invert_limit_pins)
-		pins ^= HWLIMIT_MASK;
+    signals.value = (uint8_t)(GPIOPinRead(LIMIT_PORT, HWLIMIT_MASK) >> 2);
 
-	return (axes_signals_t){pins >> 2};
+	if (settings.limit_invert_mask.value)
+	    signals.value ^= settings.limit_invert_mask.value;
+
+	return signals;
 }
 
-inline static controlsignals_t systemGetState (void) {
+inline static control_signals_t systemGetState (void) {
 
-    uint8_t flags = GPIOPinRead(CONTROL_PORT, HWCONTROL_MASK) ^ CONTROL_INVERT_MASK;
-    controlsignals_t signals = {0};
+    uint8_t flags = GPIOPinRead(CONTROL_PORT, HWCONTROL_MASK);
+    control_signals_t signals = {0};
 
     if(flags & RESET_PIN)
         signals.reset = true;
@@ -193,6 +195,9 @@ inline static controlsignals_t systemGetState (void) {
     else if(flags & CYCLE_START_PIN)
         signals.cycle_start = true;
 
+    if(settings.control_invert_mask.value)
+        signals.value ^= settings.control_invert_mask.value;
+
 	return signals;
 }
 
@@ -202,15 +207,15 @@ inline static controlsignals_t systemGetState (void) {
 static void probeConfigureInvertMask(bool is_probe_away)
 {
 
-  probe_invert_mask = settings.flags.invert_probe_pin ? 0 : PROBE_MASK;
+  probe_invert_mask = settings.flags.invert_probe_pin ? 0 : PROBE_PIN;
 
   if (is_probe_away)
-	  probe_invert_mask ^= PROBE_MASK;
+	  probe_invert_mask ^= PROBE_PIN;
 }
 
 // Returns the probe pin state. Triggered = true. Called by gcode parser and probe state monitor.
 bool probeGetState (void) {
-    return (((uint8_t)GPIOPinRead(PROBE_PORT, PROBE_MASK)) ^ probe_invert_mask) != 0;
+    return (((uint8_t)GPIOPinRead(PROBE_PORT, PROBE_PIN)) ^ probe_invert_mask) != 0;
 }
 
 // Static spindle (off, on cw & on ccw)
@@ -433,21 +438,9 @@ static void mcu_init (void) {
 
     SysCtlDelay(26); // wait a bit for peripherals to wake up
 
-  // Control pins init
-
-	GPIOPinTypeGPIOInput(CONTROL_PORT, HWCONTROL_MASK);
-	GPIOIntRegister(CONTROL_PORT, &control_isr); 		     // Register a call-back funcion for interrupt
-    if(hal.driver_cap.control_pull_up) {
-        GPIOPadConfigSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU); //Enable weak pull-ups
-        GPIOIntTypeSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_FALLING_EDGE); // Enable specific pins of the Pin Change Interrupt
-    } else {
-        GPIOPadConfigSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPD); //Enable weak pull-downs
-        GPIOIntTypeSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_RISING_EDGE); // Enable specific pins of the Pin Change Interrupt
-    }
-	GPIOIntClear(CONTROL_PORT, HWCONTROL_MASK);					 // Clear any pending interrupt
-	GPIOIntEnable(CONTROL_PORT, HWCONTROL_MASK);                 // and enable Pin Change Interrupt
-
-  // Stepper init
+    /******************
+     *  Stepper init  *
+     ******************/
 
 	GPIOPinTypeGPIOOutput(STEP_PORT, HWSTEP_MASK);
 	GPIOPadConfigSet(STEP_PORT, HWSTEP_MASK, GPIO_STRENGTH_8MA, GPIO_PIN_TYPE_STD);
@@ -485,6 +478,10 @@ static void mcu_init (void) {
 	    TimerIntEnable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
 	}
 
+   /****************************
+    *  Software debounce init  *
+    ****************************/
+
 	if(hal.driver_cap.software_debounce) {
 	    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER3);
 	    SysCtlDelay(26); // wait a bit for peripherals to wake up
@@ -499,27 +496,63 @@ static void mcu_init (void) {
         TimerIntEnable(TIMER3_BASE, TIMER_TIMA_TIMEOUT);
     }
 
-  // Limits init
+   /***********************
+    *  Control pins init  *
+    ***********************/
+
+	GPIOPinTypeGPIOInput(CONTROL_PORT, HWCONTROL_MASK);
+    GPIOIntRegister(CONTROL_PORT, &control_isr);             // Register interrupt handler
+
+    GPIOPadConfigSet(CONTROL_PORT, CYCLE_START_PIN, GPIO_STRENGTH_2MA, settings.control_disable_pullup_mask.cycle_start ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(CONTROL_PORT, FEED_HOLD_PIN, GPIO_STRENGTH_2MA, settings.control_disable_pullup_mask.feed_hold ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(CONTROL_PORT, RESET_PIN, GPIO_STRENGTH_2MA, settings.control_disable_pullup_mask.reset ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(CONTROL_PORT, SAFETY_DOOR_PIN, GPIO_STRENGTH_2MA, settings.control_disable_pullup_mask.safety_door ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+
+    GPIOIntTypeSet(CONTROL_PORT, CYCLE_START_PIN, settings.control_invert_mask.cycle_start ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+    GPIOIntTypeSet(CONTROL_PORT, FEED_HOLD_PIN, settings.control_invert_mask.feed_hold ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+    GPIOIntTypeSet(CONTROL_PORT, RESET_PIN, settings.control_invert_mask.reset ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+    GPIOIntTypeSet(CONTROL_PORT, SAFETY_DOOR_PIN, settings.control_invert_mask.safety_door ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+
+    GPIOIntClear(CONTROL_PORT, HWCONTROL_MASK);     // Clear any pending interrupt
+    GPIOIntEnable(CONTROL_PORT, HWCONTROL_MASK);    // and enable pin change interrupt
+
+   /*********************
+    *  Limit pins init  *
+    *********************/
 
 	GPIOPinTypeGPIOInput(LIMIT_PORT, HWLIMIT_MASK);
 	GPIOIntRegister(LIMIT_PORT, hal.driver_cap.software_debounce ? limit_isr_debounced : limit_isr); // Register a call-back funcion for interrupt
-	if(hal.driver_cap.limits_pull_up) {
-        GPIOPadConfigSet(LIMIT_PORT, HWLIMIT_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPD); //Enable weak pull-downs
-        GPIOIntTypeSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_RISING_EDGE); // Enable specific pins of the Pin Change Interrupt
-	} else {
-        GPIOPadConfigSet(LIMIT_PORT, HWLIMIT_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU); //Enable weak pull-ups
-        GPIOIntTypeSet(CONTROL_PORT, HWCONTROL_MASK, GPIO_FALLING_EDGE); // Enable specific pins of the Pin Change Interrupt
-	}
 
-  // Probe init
+	// Configure pullup/pulldown
+    GPIOPadConfigSet(LIMIT_PORT, X_LIMIT_PIN, GPIO_STRENGTH_2MA, settings.limit_disable_pullup_mask.x ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(LIMIT_PORT, Y_LIMIT_PIN, GPIO_STRENGTH_2MA, settings.limit_disable_pullup_mask.y ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(LIMIT_PORT, Z_LIMIT_PIN, GPIO_STRENGTH_2MA, settings.limit_disable_pullup_mask.z ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
 
-	GPIOPinTypeGPIOInput(PROBE_PORT, PROBE_MASK);
-    if(hal.driver_cap.probe_pull_up)
-        GPIOPadConfigSet(PROBE_PORT, PROBE_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPU); //Enable weak pull-ups
-	else
-        GPIOPadConfigSet(LIMIT_PORT, PROBE_MASK, GPIO_STRENGTH_2MA, GPIO_PIN_TYPE_STD_WPD); //Enable weak pull-downs
+    // Configure interrupts
+    GPIOIntTypeSet(LIMIT_PORT, X_LIMIT_PIN, settings.limit_invert_mask.x ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+    GPIOIntTypeSet(LIMIT_PORT, Y_LIMIT_PIN, settings.limit_invert_mask.y ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+    GPIOIntTypeSet(LIMIT_PORT, Z_LIMIT_PIN, settings.limit_invert_mask.z ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
 
-  // Spindle init
+   /********************
+    *  Probe pin init  *
+    ********************/
+
+	GPIOPinTypeGPIOInput(PROBE_PORT, PROBE_PIN);
+    GPIOPadConfigSet(PROBE_PORT, PROBE_PIN, GPIO_STRENGTH_2MA, hal.driver_cap.probe_pull_up ? GPIO_PIN_TYPE_STD_WPU : GPIO_PIN_TYPE_STD_WPD);
+
+   /***********************
+    *  Coolant pins init  *
+    ***********************/
+
+    GPIOPinTypeGPIOOutput(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN);
+    GPIOPinTypeGPIOOutput(COOLANT_MIST_PORT, COOLANT_MIST_PIN);
+
+    if(hal.driver_cap.amass_level == 0)
+        hal.stepper_cycles_per_tick = &stepperCyclesPerTickPrescaled;
+
+   /******************
+    *  Spindle init  *
+    ******************/
 
 	GPIOPinTypeGPIOOutput(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN);
 	GPIOPinTypeGPIOOutput(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN);
@@ -537,14 +570,6 @@ static void mcu_init (void) {
 	} else
 	    hal.spindle_set_status = &spindleSetState;
 
-  // Coolant init
-
-	GPIOPinTypeGPIOOutput(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN);
-	GPIOPinTypeGPIOOutput(COOLANT_MIST_PORT, COOLANT_MIST_PIN);
-
-	if(hal.driver_cap.amass_level == 0)
-	    hal.stepper_cycles_per_tick = &stepperCyclesPerTickPrescaled;
-
   // Set defaults
 
     setSerialReceiveCallback(hal.protocol_process_realtime);
@@ -554,7 +579,7 @@ static void mcu_init (void) {
 
 }
 
-// Initialize HAL pointers
+// Initialize HAL pointers, setup serial comms and enable EEPROM
 // NOTE: Grbl is not yet configured (from EEPROM data), mcu_init() will be called when done
 bool driver_init (void) {
 
