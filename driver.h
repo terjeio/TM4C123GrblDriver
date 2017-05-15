@@ -30,9 +30,6 @@
 
 //
 
-#define EEPROMOFFSET 0
-
-
 // Define step pulse output pins. NOTE: Routed to RGB led on Tiva C LaunchPad.
 #define STEP_PERIPH	SYSCTL_PERIPH_GPIOF
 #define STEP_PORT	GPIO_PORTF_BASE

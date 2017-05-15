@@ -67,10 +67,10 @@ status_code_t userMCodeValidate (parser_block_t *gc_block, uint16_t *value_words
 }
 
 //
-// userMcodeCheck - execute user defined M-code
+// userMcodeExecute - execute user defined M-code
 //
 
-void userMCodeExecute (parser_block_t *gc_block) {
+void userMCodeExecute (uint8_t state, parser_block_t *gc_block) {
 
     switch(gc_block->user_defined_mcode) {
 

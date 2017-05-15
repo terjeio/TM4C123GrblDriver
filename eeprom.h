@@ -23,7 +23,7 @@
   along with Grbl.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-inline uint8_t eepromGetChar (uint32_t addr);
-inline void eepromPutChar (uint32_t addr, uint8_t new_value);
+uint8_t eepromGetChar (uint32_t addr);
+void eepromPutChar (uint32_t addr, uint8_t new_value);
 void eepromWriteBlockWithChecksum (unsigned int destination, char *source, unsigned int size);
 int eepromReadBlockWithChecksum (char *destination, unsigned int source, unsigned int size);

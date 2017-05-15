@@ -4,7 +4,7 @@
                   3v3 [] [] VBUS (5v)        Step Y PF2 [] [] GND
                   PB5 [] [] GND              Step Z PF3 [] [] PB2
    Spindle enable PB0 [] [] PD0 Reset               PB3 [] [] PE0 Stepper enable
-Spindle direction PB1 [] [] PD1 Feed Hold           PC4 [] [] PF0
+Spindle direction PB1 [] [] PD1 Feed Hold       RTS PC4 [] [] PF0
       Spindle PWM PE4 [] [] PD2 Cycle Start   Dir X PC5 [] [] RST
                   PE5 [] [] PD3 Safety Door   Dir Y PC6 [] [] PB7
                   PB5 [] [] PE1               Dir Z PC7 [] [] PB6

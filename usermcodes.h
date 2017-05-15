@@ -25,4 +25,4 @@
 
 uint8_t userMCodeCheck (uint8_t mcode);
 uint8_t userMCodeValidate (parser_block_t *gc_block, uint16_t *value_words);
-void userMCodeExecute (parser_block_t *gc_block);
+void userMCodeExecute (uint8_t state, parser_block_t *gc_block);

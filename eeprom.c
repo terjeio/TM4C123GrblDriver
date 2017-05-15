@@ -28,6 +28,8 @@
 #include "tiva.h"
 #include "driver.h"
 
+#define EEPROMOFFSET 0
+
 static inline uint32_t putByte (uint32_t target, uint32_t source, uint32_t byte) {
     uint32_t mask = 0xFF;
     byte <<= 3;
@@ -55,7 +57,7 @@ static inline uint8_t calc_checksum (char *data, uint32_t size) {
 // Used by code in settingcs.c
 // NOTE: This implementation need some heap memory to work correctly, at least as much as the largest EEPROM block used + 4 bytes.
 //       It is due to Tiva C having word-aligned EEPROM access, the heap is used for temporary storage when word aligning the structs read/written.
-inline uint8_t eepromGetChar (uint32_t addr) {
+uint8_t eepromGetChar (uint32_t addr) {
 
     uint32_t data;
 
@@ -65,7 +67,7 @@ inline uint8_t eepromGetChar (uint32_t addr) {
 
 }
 
-inline void eepromPutChar (uint32_t addr, uint8_t new_value) {
+void eepromPutChar (uint32_t addr, uint8_t new_value) {
 
     uint32_t data;
 
@@ -98,7 +100,7 @@ void eepromWriteBlockWithChecksum (unsigned int destination, char *source, unsig
     } else
         EEPROMProgram((uint32_t *)source, destination + EEPROMOFFSET, size);
 
-    eeprom_put_char(destination + size, calc_checksum(source, size));
+    eepromPutChar(destination + size, calc_checksum(source, size));
 }
 
 int eepromReadBlockWithChecksum (char *destination, unsigned int source, unsigned int size) {
@@ -121,5 +123,5 @@ int eepromReadBlockWithChecksum (char *destination, unsigned int source, unsigne
     } else
         EEPROMRead((uint32_t *)destination, source + EEPROMOFFSET, size);
 
-    return calc_checksum(destination, size) == eeprom_get_char(source + size);
+    return calc_checksum(destination, size) == eepromGetChar(source + size);
 }
