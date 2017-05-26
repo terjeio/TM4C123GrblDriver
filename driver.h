@@ -5,7 +5,7 @@
 
   Part of Grbl
 
-  Copyright (c) 2016 Terje Io
+  Copyright (c) 2016-2017 Terje Io
   Copyright (c) 2011-2015 Sungeun K. Jeon
   Copyright (c) 2009-2011 Simen Svale Skogsrud
 
@@ -29,6 +29,8 @@
 //#define BLOCK_BUFFER_SIZE	36
 
 //
+
+//#define HAS_KEYPAD //uncomment to enable I2C keypad for jogging etc.
 
 // Define step pulse output pins. NOTE: Routed to RGB led on Tiva C LaunchPad.
 #define STEP_PERIPH	SYSCTL_PERIPH_GPIOF
@@ -70,13 +72,13 @@
 #define SPINDLE_DIRECTION_PIN		GPIO_PIN_1
 
 // Define flood and mist coolant enable output pins.
-#define COOLANT_FLOOD_PERIPH	SYSCTL_PERIPH_GPIOA
-#define COOLANT_FLOOD_PORT		GPIO_PORTA_BASE
-#define COOLANT_FLOOD_PIN		GPIO_PIN_5
+#define COOLANT_FLOOD_PERIPH	SYSCTL_PERIPH_GPIOD
+#define COOLANT_FLOOD_PORT		GPIO_PORTD_BASE
+#define COOLANT_FLOOD_PIN		GPIO_PIN_6
 
-#define COOLANT_MIST_PERIPH	SYSCTL_PERIPH_GPIOA
-#define COOLANT_MIST_PORT	GPIO_PORTA_BASE
-#define COOLANT_MIST_PIN	GPIO_PIN_6
+#define COOLANT_MIST_PERIPH	SYSCTL_PERIPH_GPIOD
+#define COOLANT_MIST_PORT	GPIO_PORTD_BASE
+#define COOLANT_MIST_PIN	GPIO_PIN_7
 
 // Define user-control CONTROLs (cycle start, reset, feed hold) input pins.
 // NOTE: All CONTROLs pins must be on the same port and not on a port with other input pins (limits).
@@ -91,11 +93,10 @@
 // Define probe switch input pin.
 #define PROBE_PERIPH	SYSCTL_PERIPH_GPIOA
 #define PROBE_PORT		GPIO_PORTA_BASE
-#define PROBE_PIN		GPIO_PIN_7
+#define PROBE_PIN		GPIO_PIN_5
 
 // Start of PWM & Stepper Enabled Spindle
 #ifdef VARIABLE_SPINDLE
-  #define PWM_MAX_VALUE			1000	// For 10Khz PWM frequency
   #define SPINDLEPPERIPH		SYSCTL_PERIPH_GPIOE
   #define SPINDLEPPORT			GPIO_PORTE_BASE
   #define SPINDLEPPIN			GPIO_PIN_4
@@ -105,12 +106,3 @@
   #define SPINDLEPWM_OUT_BIT	PWM_OUT_2_BIT
   #define SPINDLEPWM_MAP		GPIO_PE4_M1PWM2
 #endif // End of VARIABLE_SPINDLE
-
-  // Variable spindle configuration below. Do not change unless you know what you are doing.
-  // NOTE: Only used when variable spindle is enabled.
-  #define SPINDLE_PWM_MAX_VALUE     255 // Don't change. 328p fast PWM mode fixes top value as 255.
-  #ifndef SPINDLE_PWM_MIN_VALUE
-    #define SPINDLE_PWM_MIN_VALUE   1   // Must be greater than zero.
-  #endif
-  #define SPINDLE_PWM_OFF_VALUE     0
-  #define SPINDLE_PWM_RANGE         (SPINDLE_PWM_MAX_VALUE-SPINDLE_PWM_MIN_VALUE)

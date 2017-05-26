@@ -20,9 +20,7 @@
 #include "driverlib/pwm.h"
 #include "driverlib/uart.h"
 #include "driverlib/interrupt.h"
+#include "driverlib/systick.h"
 
 //#include "driverlib/rom.h"
 //#include "driverlib/rom_map.h"
-
-//#define LAUNCHPADTEST
-//#define CARDTEST

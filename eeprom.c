@@ -6,8 +6,6 @@
   Part of Grbl
 
   Copyright (c) 2017 Terje Io
-  Copyright (c) 2011-2015 Sungeun K. Jeon
-  Copyright (c) 2009-2011 Simen Svale Skogsrud
 
   Grbl is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -41,23 +39,11 @@ static inline uint8_t getByte (uint32_t data, uint32_t byte) {
     return (data >> (byte << 3)) & 0xFF;
 }
 
-static inline uint8_t calc_checksum (char *data, uint32_t size) {
-
-    uint8_t checksum = 0;
-
-    while(size--) {
-        checksum = (checksum << 1) || (checksum >> 7);
-        checksum += *(data++);
-    }
-
-    return checksum;
-}
-
 // Read/write eeprom configuration - do not set HAL pointers if not supported by MCU
 // Used by code in settingcs.c
 // NOTE: This implementation need some heap memory to work correctly, at least as much as the largest EEPROM block used + 4 bytes.
 //       It is due to Tiva C having word-aligned EEPROM access, the heap is used for temporary storage when word aligning the structs read/written.
-uint8_t eepromGetChar (uint32_t addr) {
+uint8_t eepromGetByte (uint32_t addr) {
 
     uint32_t data;
 
@@ -67,7 +53,7 @@ uint8_t eepromGetChar (uint32_t addr) {
 
 }
 
-void eepromPutChar (uint32_t addr, uint8_t new_value) {
+void eepromPutByte (uint32_t addr, uint8_t new_value) {
 
     uint32_t data;
 
@@ -78,7 +64,7 @@ void eepromPutChar (uint32_t addr, uint8_t new_value) {
     EEPROMProgram(&data, (addr + EEPROMOFFSET) & 0xFFFFFFFC, 4);
 }
 
-void eepromWriteBlockWithChecksum (unsigned int destination, char *source, unsigned int size) {
+void eepromWriteBlockWithChecksum (uint32_t destination, uint8_t *source, uint32_t size) {
 
     uint8_t *data;
     uint32_t alignstart = (destination & 0x03), alignend = 4 - ((alignstart + size) & 0x03), alignsize = size + alignstart + alignend;
@@ -100,10 +86,10 @@ void eepromWriteBlockWithChecksum (unsigned int destination, char *source, unsig
     } else
         EEPROMProgram((uint32_t *)source, destination + EEPROMOFFSET, size);
 
-    eepromPutChar(destination + size, calc_checksum(source, size));
+    eepromPutByte(destination + size, calc_checksum(source, size));
 }
 
-int eepromReadBlockWithChecksum (char *destination, unsigned int source, unsigned int size) {
+bool eepromReadBlockWithChecksum (uint8_t *destination, uint32_t source, uint32_t size) {
 
     uint8_t *data;
     uint32_t alignstart = (source & 0x03), alignend = 4 - ((alignstart + size) & 0x03), alignsize = size + alignstart + alignend;
@@ -123,5 +109,5 @@ int eepromReadBlockWithChecksum (char *destination, unsigned int source, unsigne
     } else
         EEPROMRead((uint32_t *)destination, source + EEPROMOFFSET, size);
 
-    return calc_checksum(destination, size) == eepromGetChar(source + size);
+    return calc_checksum(destination, size) == eepromGetByte(source + size);
 }

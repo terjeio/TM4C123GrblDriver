@@ -5,7 +5,7 @@
 
   Part of Grbl
 
-  Copyright (c) 2017 Terje Io
+  Copyright (c) 2016-2017 Terje Io
   Copyright (c) 2011-2015 Sungeun K. Jeon
   Copyright (c) 2009-2011 Simen Svale Skogsrud
 
@@ -30,6 +30,7 @@
 #include "eeprom.h"
 #include "serial.h"
 #include "usermcodes.h"
+#include "keypad.h"
 
 // TODO: handle F_CPU in a portable way - it is not used as CPU frequency but rather ticks per counter increment/decrement for timer(s)
 // This implementation prescales step counter by four for a F_CPU of 20MHz to avoid overflow in Grbl code
@@ -38,11 +39,12 @@
 // prescale step counter to 20Mhz (80 / (STEPPER_DRIVER_PRESCALER + 1))
 #define STEPPER_DRIVER_PRESCALER 3
 
-static uint32_t ms_delayCycles, us_delayCycles;
+static volatile uint32_t ms_count = 1; // NOTE: initial value 1 is for "resetting" systick timer
 static uint8_t pulse_time, pulse_delay;
-static bool pwmEnabled = false;
-static float pwm_gradient; // Precalulated value to speed up rpm to PWM conversions.
+static bool pwmEnabled = false, pwmInit = false;
 static axes_signals_t step_port_invert_mask, dir_port_invert_mask, next_step_outbits;
+
+static spindle_pwm_t spindle_pwm;
 
 static uint16_t step_prescaler[4] = {
     STEPPER_DRIVER_PRESCALER,
@@ -63,16 +65,13 @@ static void limit_isr (void);
 static void limit_isr_debounced (void);
 static void control_isr (void);
 static void software_debounce_isr (void);
+static void systick_isr (void);
 
-// NOTE: driver_delay_ms may be called with 0, causes a hang on Tiva if passed on...
-
-static void driver_delay_ms (uint16_t ms) {
-	if(ms > 0)
-		SysCtlDelay(ms_delayCycles * ms) ;
-}
-
-static void driver_delay_us (uint32_t us) {
-	SysCtlDelay(us < 1 ? us_delayCycles / 10 : --us);
+static void driver_delay_ms (uint32_t ms) {
+	if((ms_count = ms) > 0) {
+		SysTickEnable();
+		while(ms_count);
+	}
 }
 
 // Enable/disable steppers, called from st_wake_up() and st_go_idle()
@@ -191,13 +190,13 @@ inline static control_signals_t systemGetState (void)
     control_signals_t signals = {0};
 
     if(flags & RESET_PIN)
-        signals.reset = true;
+        signals.reset = on;
     else if(flags & SAFETY_DOOR_PIN)
-        signals.safety_door_ajar = true;
+        signals.safety_door_ajar = on;
     else if(flags & FEED_HOLD_PIN)
-        signals.feed_hold = true;
+        signals.feed_hold = on;
     else if(flags & CYCLE_START_PIN)
-        signals.cycle_start = true;
+        signals.cycle_start = on;
 
     if(settings.control_invert_mask.value)
         signals.value ^= settings.control_invert_mask.value;
@@ -264,20 +263,22 @@ static uint32_t spindleComputePWMValue (float rpm, uint8_t speed_ovr)
     if ((settings.rpm_min >= settings.rpm_max) || (rpm >= settings.rpm_max)) {
         // No PWM range possible. Set simple on/off spindle control pin state.
         sys.spindle_speed = settings.rpm_max;
-        pwm_value = SPINDLE_PWM_MAX_VALUE;
+        pwm_value = spindle_pwm.max_value - 1;
     } else if (rpm <= settings.rpm_min) {
         if (rpm == 0.0f) { // S0 disables spindle
             sys.spindle_speed = 0.0f;
-            pwm_value = SPINDLE_PWM_OFF_VALUE;
+            pwm_value = spindle_pwm.off_value;
         } else { // Set minimum PWM output
             sys.spindle_speed = settings.rpm_min;
-            pwm_value = SPINDLE_PWM_MIN_VALUE;
+            pwm_value = spindle_pwm.min_value;
         }
     } else {
         // Compute intermediate PWM value with linear spindle speed model.
         // NOTE: A nonlinear model could be installed here, if required, but keep it VERY light-weight.
         sys.spindle_speed = rpm;
-        pwm_value = (uint32_t)floorf((rpm - settings.rpm_min) * pwm_gradient) + SPINDLE_PWM_MIN_VALUE;
+        pwm_value = (uint32_t)floorf((rpm - settings.rpm_min) * spindle_pwm.pwm_gradient) + spindle_pwm.min_value;
+        if(pwm_value >= spindle_pwm.max_value)
+        	pwm_value = spindle_pwm.max_value - 1;
     }
 
     return pwm_value;
@@ -295,7 +296,7 @@ static uint32_t spindleSetSpeed (uint32_t pwm_value)
         if(!pwmEnabled)
             spindleOn();
         pwmEnabled = true;
-        PWMGenPeriodSet(SPINDLEPWM, SPINDLEPWM_GEN, SPINDLE_PWM_MAX_VALUE);
+        PWMGenPeriodSet(SPINDLEPWM, SPINDLEPWM_GEN, spindle_pwm.period);
         PWMPulseWidthSet(SPINDLEPWM, SPINDLEPWM_OUT, pwm_value);
         PWMGenEnable(SPINDLEPWM, SPINDLEPWM_GEN); // Ensure PWM output is enabled.
     }
@@ -333,9 +334,9 @@ static spindle_state_t spindleGetState (void)
 
     if(hal.driver_cap.spindle_dir) {
         if(GPIOPinRead(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN) == settings.flags.invert_spindle_enable ? 0 : SPINDLE_DIRECTION_PIN)
-            state.on = true;
+            state.on = on;
     } else if((GPIOPinRead(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN) == settings.flags.invert_spindle_enable ? 0 : SPINDLE_ENABLE_PIN) || pwmEnabled) {
-        state.on = true;
+        state.on = on;
         state.ccw = GPIOPinRead(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN) != 0;
     }
 
@@ -348,18 +349,16 @@ static spindle_state_t spindleGetState (void)
 static void coolantSetState (coolant_state_t mode)
 {
 
-	if(mode.value) {
+	if(mode.flood)
+		GPIOPinWrite(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN, settings.flags.invert_flood_pin ? 0 : COOLANT_FLOOD_PIN);
+	else
+		GPIOPinWrite(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN, settings.flags.invert_flood_pin ? COOLANT_FLOOD_PIN : 0);
 
-		if(mode.flood)
-            GPIOPinWrite(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN, settings.flags.invert_flood_pin ? 0 : COOLANT_FLOOD_PIN);
+	if(mode.mist)
+		GPIOPinWrite(COOLANT_MIST_PORT, COOLANT_MIST_PIN, settings.flags.invert_mist_pin ? 0 : COOLANT_MIST_PIN);
+	else
+		GPIOPinWrite(COOLANT_MIST_PORT, COOLANT_MIST_PIN, settings.flags.invert_mist_pin ? COOLANT_MIST_PIN : 0);
 
-		if(mode.mist)
-            GPIOPinWrite(COOLANT_MIST_PORT, COOLANT_MIST_PIN, settings.flags.invert_mist_pin ? 0 : COOLANT_MIST_PIN);
-
-	} else { // off
-        GPIOPinWrite(COOLANT_FLOOD_PORT, COOLANT_FLOOD_PIN, settings.flags.invert_flood_pin ? COOLANT_FLOOD_PIN : 0);
-        GPIOPinWrite(COOLANT_MIST_PORT, COOLANT_MIST_PIN, settings.flags.invert_mist_pin ? COOLANT_MIST_PIN : 0);
-	}
 }
 
 static coolant_state_t coolantGetState (void)
@@ -395,7 +394,17 @@ static void settings_changed (settings_t *settings)
     pulse_delay = settings->pulse_delay_microseconds;
     step_port_invert_mask = settings->step_invert_mask;
     dir_port_invert_mask = settings->dir_invert_mask;
-    pwm_gradient = SPINDLE_PWM_RANGE / (settings->rpm_max - settings->rpm_min);
+
+    spindle_pwm.period = (uint32_t)(10000000 / settings->spindle_pwm_freq);
+    spindle_pwm.off_value = (uint32_t)(spindle_pwm.period * settings->spindle_pwm_off_value / 100.0f);
+    spindle_pwm.min_value = (uint32_t)(spindle_pwm.period * settings->spindle_pwm_min_value / 100.0f);
+    spindle_pwm.max_value = (uint32_t)(spindle_pwm.period * settings->spindle_pwm_max_value / 100.0f);
+    spindle_pwm.pwm_gradient = (float)(spindle_pwm.max_value - spindle_pwm.min_value) / (settings->rpm_max - settings->rpm_min);
+
+    hal.spindle_pwm_off = spindle_pwm.off_value;
+
+    if(pwmInit)
+    	PWMGenPeriodSet(SPINDLEPWM, SPINDLEPWM_GEN, spindle_pwm.period);
 
 //    curr_dir_outbits = 0xFF; // "forget" current dir flags
 }
@@ -427,7 +436,7 @@ static uint8_t valueSetAtomic (volatile uint8_t *ptr, uint8_t value)
 }
 
 // Initializes MCU peripherals for Grbl use TODO: rename?
-static bool driver_setup (void)
+static bool driver_setup (settings_t *settings)
 {
   // System init
 
@@ -509,15 +518,15 @@ static bool driver_setup (void)
 	GPIOPinTypeGPIOInput(CONTROL_PORT, HWCONTROL_MASK);
     GPIOIntRegister(CONTROL_PORT, &control_isr);             // Register interrupt handler
 
-    GPIOPadConfigSet(CONTROL_PORT, CYCLE_START_PIN, GPIO_STRENGTH_2MA, settings.control_disable_pullup_mask.cycle_start ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
-    GPIOPadConfigSet(CONTROL_PORT, FEED_HOLD_PIN, GPIO_STRENGTH_2MA, settings.control_disable_pullup_mask.feed_hold ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
-    GPIOPadConfigSet(CONTROL_PORT, RESET_PIN, GPIO_STRENGTH_2MA, settings.control_disable_pullup_mask.reset ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
-    GPIOPadConfigSet(CONTROL_PORT, SAFETY_DOOR_PIN, GPIO_STRENGTH_2MA, settings.control_disable_pullup_mask.safety_door_ajar ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(CONTROL_PORT, CYCLE_START_PIN, GPIO_STRENGTH_2MA, settings->control_disable_pullup_mask.cycle_start ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(CONTROL_PORT, FEED_HOLD_PIN, GPIO_STRENGTH_2MA, settings->control_disable_pullup_mask.feed_hold ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(CONTROL_PORT, RESET_PIN, GPIO_STRENGTH_2MA, settings->control_disable_pullup_mask.reset ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(CONTROL_PORT, SAFETY_DOOR_PIN, GPIO_STRENGTH_2MA, settings->control_disable_pullup_mask.safety_door_ajar ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
 
-    GPIOIntTypeSet(CONTROL_PORT, CYCLE_START_PIN, settings.control_invert_mask.cycle_start ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
-    GPIOIntTypeSet(CONTROL_PORT, FEED_HOLD_PIN, settings.control_invert_mask.feed_hold ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
-    GPIOIntTypeSet(CONTROL_PORT, RESET_PIN, settings.control_invert_mask.reset ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
-    GPIOIntTypeSet(CONTROL_PORT, SAFETY_DOOR_PIN, settings.control_invert_mask.safety_door_ajar ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+    GPIOIntTypeSet(CONTROL_PORT, CYCLE_START_PIN, settings->control_invert_mask.cycle_start ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+    GPIOIntTypeSet(CONTROL_PORT, FEED_HOLD_PIN, settings->control_invert_mask.feed_hold ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+    GPIOIntTypeSet(CONTROL_PORT, RESET_PIN, settings->control_invert_mask.reset ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+    GPIOIntTypeSet(CONTROL_PORT, SAFETY_DOOR_PIN, settings->control_invert_mask.safety_door_ajar ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
 
     GPIOIntClear(CONTROL_PORT, HWCONTROL_MASK);     // Clear any pending interrupt
     GPIOIntEnable(CONTROL_PORT, HWCONTROL_MASK);    // and enable pin change interrupt
@@ -530,14 +539,14 @@ static bool driver_setup (void)
 	GPIOIntRegister(LIMIT_PORT, hal.driver_cap.software_debounce ? limit_isr_debounced : limit_isr); // Register a call-back funcion for interrupt
 
 	// Configure pullup/pulldown
-    GPIOPadConfigSet(LIMIT_PORT, X_LIMIT_PIN, GPIO_STRENGTH_2MA, settings.limit_disable_pullup_mask.x ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
-    GPIOPadConfigSet(LIMIT_PORT, Y_LIMIT_PIN, GPIO_STRENGTH_2MA, settings.limit_disable_pullup_mask.y ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
-    GPIOPadConfigSet(LIMIT_PORT, Z_LIMIT_PIN, GPIO_STRENGTH_2MA, settings.limit_disable_pullup_mask.z ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(LIMIT_PORT, X_LIMIT_PIN, GPIO_STRENGTH_2MA, settings->limit_disable_pullup_mask.x ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(LIMIT_PORT, Y_LIMIT_PIN, GPIO_STRENGTH_2MA, settings->limit_disable_pullup_mask.y ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
+    GPIOPadConfigSet(LIMIT_PORT, Z_LIMIT_PIN, GPIO_STRENGTH_2MA, settings->limit_disable_pullup_mask.z ? GPIO_PIN_TYPE_STD_WPD : GPIO_PIN_TYPE_STD_WPU);
 
     // Configure interrupts
-    GPIOIntTypeSet(LIMIT_PORT, X_LIMIT_PIN, settings.limit_invert_mask.x ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
-    GPIOIntTypeSet(LIMIT_PORT, Y_LIMIT_PIN, settings.limit_invert_mask.y ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
-    GPIOIntTypeSet(LIMIT_PORT, Z_LIMIT_PIN, settings.limit_invert_mask.z ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+    GPIOIntTypeSet(LIMIT_PORT, X_LIMIT_PIN, settings->limit_invert_mask.x ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+    GPIOIntTypeSet(LIMIT_PORT, Y_LIMIT_PIN, settings->limit_invert_mask.y ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
+    GPIOIntTypeSet(LIMIT_PORT, Z_LIMIT_PIN, settings->limit_invert_mask.z ? GPIO_FALLING_EDGE : GPIO_RISING_EDGE);
 
    /********************
     *  Probe pin init  *
@@ -567,7 +576,7 @@ static bool driver_setup (void)
     GPIOPadConfigSet(SPINDLE_ENABLE_PORT, SPINDLE_ENABLE_PIN, GPIO_STRENGTH_8MA, GPIO_PIN_TYPE_STD);
     GPIOPadConfigSet(SPINDLE_DIRECTION_PORT, SPINDLE_DIRECTION_PIN, GPIO_STRENGTH_8MA, GPIO_PIN_TYPE_STD);
 
-	if(hal.driver_cap.variable_spindle) {
+	if((pwmInit = hal.driver_cap.variable_spindle)) {
 	    SysCtlPWMClockSet(SYSCTL_PWMDIV_8);
 	    SysCtlPeripheralEnable(SYSCTL_PERIPH_PWM1);
         SysCtlDelay(26); // wait a bit for peripherals to wake up
@@ -575,19 +584,29 @@ static bool driver_setup (void)
         GPIOPinTypePWM(SPINDLEPPORT, SPINDLEPPIN);
         GPIOPadConfigSet(SPINDLEPPORT, SPINDLEPPIN, GPIO_STRENGTH_8MA, GPIO_PIN_TYPE_STD);
         PWMGenConfigure(SPINDLEPWM, SPINDLEPWM_GEN, PWM_GEN_MODE_DOWN|PWM_GEN_MODE_GEN_SYNC_LOCAL);
-        PWMGenPeriodSet(SPINDLEPWM, SPINDLEPWM_GEN, PWM_MAX_VALUE);
+        PWMGenPeriodSet(SPINDLEPWM, SPINDLEPWM_GEN, spindle_pwm.period);
         PWMOutputState(SPINDLEPWM, SPINDLEPWM_OUT_BIT, true);
 	} else
 	    hal.spindle_set_status = &spindleSetState;
 
+#ifdef HAS_KEYPAD
+
+   /*********************
+    *  I2C KeyPad init  *
+	*********************/
+
+	keypad_setup();
+
+#endif
+
   // Set defaults
 
     setSerialReceiveCallback(hal.protocol_process_realtime);
-    spindleSetState((spindle_state_t){0}, SPINDLE_PWM_OFF_VALUE, DEFAULT_SPINDLE_SPEED_OVERRIDE);
+    spindleSetState((spindle_state_t){0}, spindle_pwm.off_value, DEFAULT_SPINDLE_SPEED_OVERRIDE);
     coolantSetState((coolant_state_t){0});
     stepperSetDirOutputs((axes_signals_t){0});
 
-    return settings.version == 11;
+    return settings->version == 12;
 
 }
 
@@ -595,9 +614,12 @@ static bool driver_setup (void)
 // NOTE: Grbl is not yet configured (from EEPROM data), driver_setup() will be called when done
 bool driver_init (void)
 {
-	ms_delayCycles = SysCtlClockGet() / 3000; // tics per ms
-	us_delayCycles = ms_delayCycles / 1000; // tics per us
+	// Set up systick time with a 1ms period
 
+	SysTickPeriodSet((SysCtlClockGet() / 1000) - 1);
+	SysTickIntRegister(systick_isr);
+	SysTickIntEnable();
+	SysTickEnable();
 	// Enable EEPROM and serial port here for Grbl to be able to configure itself and report any errors
 
 	SysCtlPeripheralEnable(SYSCTL_PERIPH_EEPROM0);
@@ -610,7 +632,6 @@ bool driver_init (void)
 	hal.f_step_timer = 20000000;
 	hal.rx_buffer_size = RX_BUFFER_SIZE;
 	hal.delay_ms = &driver_delay_ms;
-	hal.delay_us = &driver_delay_us;
     hal.settings_changed = &settings_changed;
 
 	hal.stepper_wake_up = &stepperWakeUp;
@@ -645,8 +666,8 @@ bool driver_init (void)
     hal.serial_cancel_read_buffer = &serialRxCancel;
 
     hal.eeprom.type = EEPROM_Physical;
-	hal.eeprom.get_char = &eepromGetChar;
-	hal.eeprom.put_char = &eepromPutChar;
+	hal.eeprom.get_byte = &eepromGetByte;
+	hal.eeprom.put_byte = &eepromPutByte;
 	hal.eeprom.memcpy_to_with_checksum = &eepromWriteBlockWithChecksum;
 	hal.eeprom.memcpy_from_with_checksum = &eepromReadBlockWithChecksum;
 
@@ -658,16 +679,20 @@ bool driver_init (void)
     hal.userdefined_mcode_validate = &userMCodeValidate;
     hal.userdefined_mcode_execute = &userMCodeExecute;
 
+#ifdef HAS_KEYPAD
+    hal.execute_realtime = &process_keypress;
+#endif
+
   // driver capabilities, used for announcing and negotiating (with Grbl) driver functionality
 
-    hal.driver_cap.variable_spindle = true;
-    hal.driver_cap.mist_control = true;
-    hal.driver_cap.software_debounce = true;
-    hal.driver_cap.step_pulse_delay = true;
+    hal.driver_cap.variable_spindle = on;
+    hal.driver_cap.mist_control = on;
+    hal.driver_cap.software_debounce = on;
+    hal.driver_cap.step_pulse_delay = on;
     hal.driver_cap.amass_level = 3;
-    hal.driver_cap.control_pull_up = true;
-    hal.driver_cap.limits_pull_up = true;
-    hal.driver_cap.probe_pull_up = true;
+    hal.driver_cap.control_pull_up = on;
+    hal.driver_cap.limits_pull_up = on;
+    hal.driver_cap.probe_pull_up = on;
 
     // no need to move version check before init - compiler will fail any mismatch for existing entries
 	return hal.version == 3;
@@ -752,3 +777,8 @@ static void control_isr (void)
 	}
 }
 
+// Interrupt handler for 1 ms interval timer
+static void systick_isr (void) {
+	if(!(--ms_count))
+		SysTickDisable();
+}

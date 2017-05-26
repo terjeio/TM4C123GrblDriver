@@ -1,5 +1,5 @@
 /*
-  eeprom.h - An embedded CNC Controller with rs274/ngc (g-code) support
+  keypad.h - An embedded CNC Controller with rs274/ngc (g-code) support
 
   Driver code for Texas Instruments Tiva C (TM4C123GH6PM) ARM processor
 
@@ -21,7 +21,17 @@
   along with Grbl.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-uint8_t eepromGetByte (uint32_t addr);
-void eepromPutByte (uint32_t addr, uint8_t new_value);
-void eepromWriteBlockWithChecksum (uint32_t destination, uint8_t *source, uint32_t size);
-bool eepromReadBlockWithChecksum (uint8_t *destination, uint32_t source, uint32_t size);
+#define KEYBUF_SIZE 16
+#define KEYPAD_I2CADDR 0x49
+
+#define KEYINTR_PIN   GPIO_PIN_4
+#define KEYINTR_PORT  GPIO_PORTB_BASE
+
+typedef enum {
+	JogMode_Fast = 0,
+	JogMode_Slow,
+	JogMode_Step
+} jogmode_t;
+
+void keypad_setup (void);
+void process_keypress (uint8_t state);
