@@ -68,8 +68,8 @@ static void driver_delay_ms (uint32_t ms, void (*callback)(void))
 		SysTickEnable();
 		if(!(delayCallback = callback))
 			while(ms_count);
-	} else
-        delayCallback = 0;
+	} else if(callback)
+		callback();
 }
 
 // Enable/disable steppers, called from st_wake_up() and st_go_idle()
@@ -790,7 +790,9 @@ static void systick_isr (void)
 {
 	if(!(--ms_count)) {
 		SysTickDisable();
-		if(delayCallback)
+		if(delayCallback) {
 			delayCallback();
+			delayCallback = 0;
+		}
 	}
 }

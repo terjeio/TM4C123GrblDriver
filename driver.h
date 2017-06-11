@@ -30,7 +30,7 @@
 
 //
 
-#define HAS_KEYPAD //uncomment to enable I2C keypad for jogging etc.
+//#define HAS_KEYPAD //uncomment to enable I2C keypad for jogging etc.
 
 // Define step pulse output pins. NOTE: Routed to RGB led on Tiva C LaunchPad.
 #define STEP_PERIPH	SYSCTL_PERIPH_GPIOF
