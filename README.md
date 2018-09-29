@@ -1,5 +1,12 @@
 # TM4C123GrblDriver
-A Grbl driver for Texas Instruments Tiva C Launchpad, for my HALified library fork of Grbl
+
+---
+
+#### This version is no longer maintained, newer releases can be found [here](https://github.com/terjeio/grblHAL).
+
+---
+
+A Grbl driver for Texas Instruments Tiva C Launchpad, for my [HALified fork of Grbl](https://github.com/terjeio/grbl).
 
 This driver needs to be complemented with an UART or USB driver for host communication.
 
